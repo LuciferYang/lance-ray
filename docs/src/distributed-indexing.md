@@ -410,6 +410,16 @@ plan = lr.vector_search(
 print(plan)
 ```
 
+### Binary Vector Search
+
+For binary vectors, set `nearest["metric"] = "hamming"`. The fallback requires
+list-like `uint8` vectors containing packed bits and a query of integer bytes
+in `[0, 255]`. It uses the same bit-level Hamming distance as Lance:
+`sum(popcount(q[i] ^ v[i]))`, not the number of unequal bytes. Distances are
+returned as `float32` and sorted in ascending order. For example, the distance
+between `[0, 0]` and `[255, 0]` is 8, not 1. Null vectors and null byte elements
+are rejected by the fallback instead of silently producing a distance.
+
 ### Custom Ray Options
 
 ```python

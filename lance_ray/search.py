@@ -421,8 +421,23 @@ def _compute_vector_distances(
 ) -> Any:
     import numpy as np
 
-    matrix = _vector_column_to_numpy(vector_column)
-    query_vector = np.asarray(query, dtype=np.float32)
+    if metric == "hamming":
+        vector_type = vector_column.type
+        if not (
+            pa.types.is_list(vector_type)
+            or pa.types.is_large_list(vector_type)
+            or pa.types.is_fixed_size_list(vector_type)
+        ) or not pa.types.is_uint8(vector_type.value_type):
+            raise ValueError(
+                "Hamming fallback requires a list-like uint8 vector column"
+            )
+        if pc.list_flatten(vector_column).null_count:
+            raise ValueError("Hamming fallback does not support null vector elements")
+        matrix = _vector_column_to_numpy(vector_column, dtype=np.uint8)
+        query_vector = np.asarray(query)
+    else:
+        matrix = _vector_column_to_numpy(vector_column)
+        query_vector = np.asarray(query, dtype=np.float32)
     if query_vector.ndim != 1:
         raise ValueError("nearest['q'] must be a one-dimensional vector")
     if matrix.shape[1] != query_vector.shape[0]:
@@ -449,7 +464,22 @@ def _compute_vector_distances(
         # Preserve Lance's offset so indexed and flat candidates are comparable.
         return (1.0 - matrix @ query_vector).astype(np.float32)
     if metric == "hamming":
-        return np.count_nonzero(matrix != query_vector, axis=1).astype(np.float32)
+        if (
+            query_vector.dtype.kind not in "iu"
+            or np.any(query_vector < 0)
+            or np.any(query_vector > 255)
+        ):
+            raise ValueError(
+                "Hamming query must contain integers in the range 0 to 255"
+            )
+        # Lance stores packed bits in uint8 elements: count differing bits, not
+        # differing bytes. A lookup table avoids expanding the matrix with
+        # unpackbits and works on NumPy versions without bitwise_count.
+        popcounts = np.array(
+            [value.bit_count() for value in range(256)], dtype=np.uint8
+        )
+        xor = np.bitwise_xor(matrix, query_vector.astype(np.uint8))
+        return popcounts[xor].sum(axis=1, dtype=np.uint64).astype(np.float32)
 
     raise ValueError(
         "Unsupported fallback vector search metric "
@@ -457,15 +487,19 @@ def _compute_vector_distances(
     )
 
 
-def _vector_column_to_numpy(vector_column: pa.ChunkedArray[Any]) -> Any:
+def _vector_column_to_numpy(
+    vector_column: pa.ChunkedArray[Any], *, dtype: Any = None
+) -> Any:
     import numpy as np
 
+    if dtype is None:
+        dtype = np.float32
     values = vector_column.combine_chunks().to_pylist()
     if not values:
-        return np.empty((0, 0), dtype=np.float32)
+        return np.empty((0, 0), dtype=dtype)
     if any(value is None for value in values):
         raise ValueError("Fallback vector search does not support null vectors")
-    matrix = np.asarray(values, dtype=np.float32)
+    matrix = np.asarray(values, dtype=dtype)
     if matrix.ndim != 2:
         raise ValueError("Fallback vector search requires a list-like vector column")
     return matrix
