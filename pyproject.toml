@@ -86,7 +86,7 @@ enable_error_code = ["ignore-without-code"]
 untyped_calls_exclude = ["ray", "lance"]
 
 [[tool.mypy.overrides]]
-module = ["PIL.*", "geoarrow.*", "more_itertools.*"]
+module = ["PIL.*", "geoarrow.*"]
 ignore_missing_imports = true
 
 # ``ray`` and ``lance`` ship a py.typed marker but re-export names between
