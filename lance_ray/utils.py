@@ -121,8 +121,10 @@ def has_namespace_params(
 
     Returns:
         True if both namespace_impl and table_id are provided, False otherwise.
+        Empty values ("" or []) count as not provided, so they fail validation
+        at the API boundary instead of erroring inside the namespace client.
     """
-    return namespace_impl is not None and table_id is not None
+    return bool(namespace_impl) and bool(table_id)
 
 
 def validate_uri_or_namespace(
