@@ -1,7 +1,11 @@
 """Tests for old-version cleanup helpers."""
 
+from __future__ import annotations
+
+from collections.abc import Callable
 from datetime import timedelta
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import lance_ray as lr
@@ -9,7 +13,7 @@ import pytest
 from lance_ray.cleanup import _LIST_TABLES_PAGE_SIZE, CLEANUP_STATS_FIELDS
 
 
-def make_cleanup_stats(**overrides):
+def make_cleanup_stats(**overrides: int) -> Any:
     """Build a stand-in for ``lance.lance.CleanupStats`` (attribute access)."""
     values = {
         "bytes_removed": 0,
@@ -23,7 +27,7 @@ def make_cleanup_stats(**overrides):
     return SimpleNamespace(**values)
 
 
-def cleanup_stats_dict(**overrides):
+def cleanup_stats_dict(**overrides: int) -> dict[str, Any]:
     """The dict form of ``make_cleanup_stats`` — kept in lock-step with it."""
     return dict(vars(make_cleanup_stats(**overrides)))
 
@@ -31,14 +35,14 @@ def cleanup_stats_dict(**overrides):
 class FakeAsyncResult:
     """Stand-in for the ``AsyncResult`` returned by ``Pool.map_async``."""
 
-    def __init__(self, results):
+    def __init__(self, results: list[Any]) -> None:
         self._results = results
 
-    def get(self):
+    def get(self) -> list[Any]:
         return self._results
 
 
-def test_cleanup_stats_fields_match_lance_cleanup_stats():
+def test_cleanup_stats_fields_match_lance_cleanup_stats() -> None:
     """Guard that every field we read off ``CleanupStats`` actually exists.
 
     ``_cleanup_stats_to_dict`` does ``getattr(stats, field)`` for each name in
@@ -55,8 +59,8 @@ def test_cleanup_stats_fields_match_lance_cleanup_stats():
     assert not missing, f"CLEANUP_STATS_FIELDS not present on CleanupStats: {missing}"
 
 
-def test_cleanup_old_versions_passes_options_to_lance_dataset(monkeypatch):
-    captured = {}
+def test_cleanup_old_versions_passes_options_to_lance_dataset(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
     stats = make_cleanup_stats(
         bytes_removed=10,
         old_versions=2,
@@ -67,10 +71,10 @@ def test_cleanup_old_versions_passes_options_to_lance_dataset(monkeypatch):
     )
 
     class FakeDataset:
-        def __init__(self, uri, **kwargs):
+        def __init__(self, uri: str, **kwargs: Any) -> None:
             captured["dataset"] = {"uri": uri, **kwargs}
 
-        def cleanup_old_versions(self, **kwargs):
+        def cleanup_old_versions(self, **kwargs: Any) -> Any:
             captured["cleanup"] = kwargs
             return stats
 
@@ -100,15 +104,15 @@ def test_cleanup_old_versions_passes_options_to_lance_dataset(monkeypatch):
     }
 
 
-def test_cleanup_old_versions_resolves_namespace_storage_options(monkeypatch):
-    captured = {}
+def test_cleanup_old_versions_resolves_namespace_storage_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
     stats = make_cleanup_stats()
 
     class FakeDataset:
-        def __init__(self, uri, **kwargs):
+        def __init__(self, uri: str, **kwargs: Any) -> None:
             captured["dataset"] = {"uri": uri, **kwargs}
 
-        def cleanup_old_versions(self, **kwargs):
+        def cleanup_old_versions(self, **kwargs: Any) -> Any:
             return stats
 
     namespace = MagicMock()
@@ -154,7 +158,7 @@ def test_cleanup_old_versions_resolves_namespace_storage_options(monkeypatch):
     assert request.id == ["db", "table"]
 
 
-def test_cleanup_old_versions_missing_namespace_location_raises(monkeypatch):
+def test_cleanup_old_versions_missing_namespace_location_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     namespace = MagicMock()
     namespace.describe_table.return_value = SimpleNamespace(
         location=None,
@@ -174,12 +178,12 @@ def test_cleanup_old_versions_missing_namespace_location_raises(monkeypatch):
         )
 
 
-def test_cleanup_old_versions_requires_uri_or_namespace():
+def test_cleanup_old_versions_requires_uri_or_namespace() -> None:
     with pytest.raises(ValueError, match="Must provide either"):
         lr.cleanup_old_versions()
 
 
-def test_cleanup_old_versions_rejects_uri_and_namespace_together():
+def test_cleanup_old_versions_rejects_uri_and_namespace_together() -> None:
     with pytest.raises(ValueError, match="Cannot provide both"):
         lr.cleanup_old_versions(
             uri="s3://bucket/table.lance",
@@ -189,7 +193,7 @@ def test_cleanup_old_versions_rejects_uri_and_namespace_together():
 
 
 @pytest.mark.parametrize("retain_versions", [0, -1])
-def test_cleanup_old_versions_rejects_nonpositive_retain_versions(retain_versions):
+def test_cleanup_old_versions_rejects_nonpositive_retain_versions(retain_versions: int) -> None:
     # retain_versions=0 triggers a Rust PanicException in Lance core (a
     # BaseException that escapes our worker's `except Exception`); guard early.
     with pytest.raises(ValueError, match="retain_versions.*positive"):
@@ -199,17 +203,17 @@ def test_cleanup_old_versions_rejects_nonpositive_retain_versions(retain_version
         )
 
 
-def test_cleanup_old_versions_uses_safe_defaults(monkeypatch):
+def test_cleanup_old_versions_uses_safe_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     # Pin the safety/policy defaults: a regression flipping delete_unverified to
     # True or error_if_tagged_old_versions to False must fail here.
-    captured = {}
+    captured: dict[str, Any] = {}
     stats = make_cleanup_stats()
 
     class FakeDataset:
-        def __init__(self, uri, **kwargs):
+        def __init__(self, uri: str, **kwargs: Any) -> None:
             captured["dataset"] = {"uri": uri, **kwargs}
 
-        def cleanup_old_versions(self, **kwargs):
+        def cleanup_old_versions(self, **kwargs: Any) -> Any:
             captured["cleanup"] = kwargs
             return stats
 
@@ -227,17 +231,17 @@ def test_cleanup_old_versions_uses_safe_defaults(monkeypatch):
     }
 
 
-def test_cleanup_database_old_versions_empty_database_raises():
+def test_cleanup_database_old_versions_empty_database_raises() -> None:
     with pytest.raises(ValueError, match="database.*non-empty"):
         lr.cleanup_database_old_versions(database=[], namespace_impl="dir")
 
 
-def test_cleanup_database_old_versions_missing_namespace_impl_raises():
+def test_cleanup_database_old_versions_missing_namespace_impl_raises() -> None:
     with pytest.raises(ValueError, match="namespace_impl.*required"):
         lr.cleanup_database_old_versions(database=["db"], namespace_impl="")
 
 
-def test_cleanup_database_old_versions_empty_tables_returns_empty_list():
+def test_cleanup_database_old_versions_empty_tables_returns_empty_list() -> None:
     namespace = MagicMock()
     namespace.list_tables.return_value = SimpleNamespace(tables=[], page_token=None)
 
@@ -255,8 +259,8 @@ def test_cleanup_database_old_versions_empty_tables_returns_empty_list():
         )
 
 
-def test_cleanup_database_old_versions_runs_tables_in_pool(monkeypatch):
-    captured = {"cleanup_calls": []}
+def test_cleanup_database_old_versions_runs_tables_in_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {"cleanup_calls": []}
     stats_by_table = {
         ("db", "table_a"): make_cleanup_stats(bytes_removed=1, old_versions=1),
         ("db", "table_b"): make_cleanup_stats(bytes_removed=2, old_versions=2),
@@ -269,23 +273,27 @@ def test_cleanup_database_old_versions_runs_tables_in_pool(monkeypatch):
     )
 
     class FakePool:
-        def __init__(self, processes, ray_remote_args=None):
+        def __init__(
+            self, processes: int, ray_remote_args: dict[str, Any] | None = None
+        ) -> None:
             captured["pool"] = {
                 "processes": processes,
                 "ray_remote_args": ray_remote_args,
             }
 
-        def map_async(self, func, items, chunksize=1):
+        def map_async(
+            self, func: Callable[..., Any], items: list[Any], chunksize: int = 1
+        ) -> FakeAsyncResult:
             captured["map"] = {"items": items, "chunksize": chunksize}
             return FakeAsyncResult([func(item) for item in items])
 
-        def close(self):
+        def close(self) -> None:
             captured["closed"] = True
 
-        def join(self):
+        def join(self) -> None:
             captured["joined"] = True
 
-    def fake_cleanup_old_versions(**kwargs):
+    def fake_cleanup_old_versions(**kwargs: Any) -> Any:
         captured["cleanup_calls"].append(kwargs)
         return stats_by_table[tuple(kwargs["table_id"])]
 
@@ -358,8 +366,8 @@ def test_cleanup_database_old_versions_runs_tables_in_pool(monkeypatch):
     ]
 
 
-def test_cleanup_database_old_versions_paginates_tables(monkeypatch):
-    captured = {"requests": []}
+def test_cleanup_database_old_versions_paginates_tables(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {"requests": []}
     stats = make_cleanup_stats(bytes_removed=1, old_versions=1)
     namespace = MagicMock()
 
@@ -371,7 +379,7 @@ def test_cleanup_database_old_versions_paginates_tables(monkeypatch):
         "p3": (["table_c"], None),
     }
 
-    def list_tables(request):
+    def list_tables(request: Any) -> SimpleNamespace:
         captured["requests"].append(request)
         tables, next_token = pages[request.page_token]
         return SimpleNamespace(tables=tables, page_token=next_token)
@@ -379,16 +387,20 @@ def test_cleanup_database_old_versions_paginates_tables(monkeypatch):
     namespace.list_tables.side_effect = list_tables
 
     class FakePool:
-        def __init__(self, processes, ray_remote_args=None):
+        def __init__(
+            self, processes: int, ray_remote_args: dict[str, Any] | None = None
+        ) -> None:
             pass
 
-        def map_async(self, func, items, chunksize=1):
+        def map_async(
+            self, func: Callable[..., Any], items: list[Any], chunksize: int = 1
+        ) -> FakeAsyncResult:
             return FakeAsyncResult([func(item) for item in items])
 
-        def close(self):
+        def close(self) -> None:
             pass
 
-        def join(self):
+        def join(self) -> None:
             pass
 
     monkeypatch.setattr(
@@ -437,7 +449,7 @@ def test_cleanup_database_old_versions_paginates_tables(monkeypatch):
     ]
 
 
-def test_cleanup_database_old_versions_raises_on_table_failure(monkeypatch):
+def test_cleanup_database_old_versions_raises_on_table_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     namespace = MagicMock()
     namespace.list_tables.return_value = SimpleNamespace(
         tables=["table_a", "table_b", "table_c"],
@@ -445,16 +457,20 @@ def test_cleanup_database_old_versions_raises_on_table_failure(monkeypatch):
     )
 
     class FakePool:
-        def __init__(self, processes, ray_remote_args=None):
+        def __init__(
+            self, processes: int, ray_remote_args: dict[str, Any] | None = None
+        ) -> None:
             pass
 
-        def map_async(self, func, items, chunksize=1):
+        def map_async(
+            self, func: Callable[..., Any], items: list[Any], chunksize: int = 1
+        ) -> FakeAsyncResult:
             return FakeAsyncResult([func(item) for item in items])
 
-        def close(self):
+        def close(self) -> None:
             pass
 
-        def join(self):
+        def join(self) -> None:
             pass
 
     monkeypatch.setattr(
@@ -463,7 +479,7 @@ def test_cleanup_database_old_versions_raises_on_table_failure(monkeypatch):
     )
     monkeypatch.setattr("lance_ray.cleanup.Pool", FakePool)
 
-    def fake_cleanup_old_versions(**kwargs):
+    def fake_cleanup_old_versions(**kwargs: Any) -> Any:
         if kwargs["table_id"] == ["db", "table_b"]:
             return make_cleanup_stats()
         raise RuntimeError(f"boom {kwargs['table_id'][-1]}")
@@ -486,7 +502,7 @@ def test_cleanup_database_old_versions_raises_on_table_failure(monkeypatch):
     )
 
 
-def test_cleanup_database_old_versions_invalid_num_workers_raises():
+def test_cleanup_database_old_versions_invalid_num_workers_raises() -> None:
     with pytest.raises(ValueError, match="num_workers.*positive"):
         lr.cleanup_database_old_versions(
             database=["db"],
@@ -497,8 +513,8 @@ def test_cleanup_database_old_versions_invalid_num_workers_raises():
 
 @pytest.mark.parametrize("retain_versions", [0, -1])
 def test_cleanup_database_old_versions_rejects_nonpositive_retain_versions(
-    retain_versions,
-):
+    retain_versions: int,
+) -> None:
     with pytest.raises(ValueError, match="retain_versions.*positive"):
         lr.cleanup_database_old_versions(
             database=["db"],
@@ -507,10 +523,10 @@ def test_cleanup_database_old_versions_rejects_nonpositive_retain_versions(
         )
 
 
-def test_cleanup_database_old_versions_uses_safe_defaults(monkeypatch):
+def test_cleanup_database_old_versions_uses_safe_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     # Pin the per-table safety/policy defaults AND the num_workers=4 default
     # (observable only with >4 tables, since processes = min(num_workers, n)).
-    captured = {"calls": []}
+    captured: dict[str, Any] = {"calls": []}
     namespace = MagicMock()
     namespace.list_tables.return_value = SimpleNamespace(
         tables=["t1", "t2", "t3", "t4", "t5"],
@@ -518,20 +534,24 @@ def test_cleanup_database_old_versions_uses_safe_defaults(monkeypatch):
     )
 
     class FakePool:
-        def __init__(self, processes, ray_remote_args=None):
+        def __init__(
+            self, processes: int, ray_remote_args: dict[str, Any] | None = None
+        ) -> None:
             captured["processes"] = processes
             captured["ray_remote_args"] = ray_remote_args
 
-        def map_async(self, func, items, chunksize=1):
+        def map_async(
+            self, func: Callable[..., Any], items: list[Any], chunksize: int = 1
+        ) -> FakeAsyncResult:
             return FakeAsyncResult([func(item) for item in items])
 
-        def close(self):
+        def close(self) -> None:
             pass
 
-        def join(self):
+        def join(self) -> None:
             pass
 
-    def fake_cleanup_old_versions(**kwargs):
+    def fake_cleanup_old_versions(**kwargs: Any) -> Any:
         captured["calls"].append(kwargs)
         return make_cleanup_stats()
 
@@ -559,7 +579,7 @@ def test_cleanup_database_old_versions_uses_safe_defaults(monkeypatch):
         assert call["storage_options"] is None
 
 
-def test_cleanup_database_old_versions_namespace_creation_failure_raises(monkeypatch):
+def test_cleanup_database_old_versions_namespace_creation_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "lance_ray.cleanup.get_or_create_namespace",
         lambda namespace_impl, namespace_properties: None,
@@ -572,32 +592,36 @@ def test_cleanup_database_old_versions_namespace_creation_failure_raises(monkeyp
         )
 
 
-def test_cleanup_database_old_versions_pool_get_failure_raises(monkeypatch):
+def test_cleanup_database_old_versions_pool_get_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     namespace = MagicMock()
     namespace.list_tables.return_value = SimpleNamespace(
         tables=["table_a"],
         page_token=None,
     )
 
-    captured = {}
+    captured: dict[str, Any] = {}
 
     class FailingAsyncResult:
-        def get(self):
+        def get(self) -> list[Any]:
             raise RuntimeError("ray unavailable")
 
     class FakePool:
-        def __init__(self, processes, ray_remote_args=None):
+        def __init__(
+            self, processes: int, ray_remote_args: dict[str, Any] | None = None
+        ) -> None:
             self.closed = False
             self.joined = False
             captured["pool"] = self
 
-        def map_async(self, func, items, chunksize=1):
+        def map_async(
+            self, func: Callable[..., Any], items: list[Any], chunksize: int = 1
+        ) -> FailingAsyncResult:
             return FailingAsyncResult()
 
-        def close(self):
+        def close(self) -> None:
             self.closed = True
 
-        def join(self):
+        def join(self) -> None:
             self.joined = True
 
     monkeypatch.setattr(
