@@ -1,23 +1,35 @@
 """Tests for LanceDatasource namespace option resolution."""
 
+from __future__ import annotations
+
 import sys
+from collections.abc import Iterator
 from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pyarrow as pa
+import pytest
 from lance_ray import datasource as datasource_mod
 
 
-def test_read_namespace_uses_described_location_and_storage_options(monkeypatch):
-    captured = {}
+def test_read_namespace_uses_described_location_and_storage_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
 
     class DescribeTableRequest:
-        def __init__(self, id, version=None, vend_credentials=None):
+        def __init__(
+            self,
+            id: list[str],
+            version: int | None = None,
+            vend_credentials: bool | None = None,
+        ) -> None:
             self.id = id
             self.version = version
             self.vend_credentials = vend_credentials
 
     class FakeNamespace:
-        def describe_table(self, request):
+        def describe_table(self, request: DescribeTableRequest) -> SimpleNamespace:
             captured["describe_table_request"] = request
             return SimpleNamespace(
                 location="s3://bucket1/lance_minio_catalog/schema/my_table32/",
@@ -34,36 +46,37 @@ def test_read_namespace_uses_described_location_and_storage_options(monkeypatch)
             )
 
     lance_namespace = ModuleType("lance_namespace")
-    lance_namespace.DescribeTableRequest = DescribeTableRequest
+    # Attribute is set on a dynamically created stub module; mypy cannot model it.
+    lance_namespace.DescribeTableRequest = DescribeTableRequest  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "lance_namespace", lance_namespace)
 
     import lance
 
     class FakeScanner:
-        def count_rows(self):
+        def count_rows(self) -> int:
             return 1
 
     class FakeFragment:
         schema = pa.schema([("value", pa.int64())])
         metadata = SimpleNamespace(id=7)
 
-        def data_files(self):
+        def data_files(self) -> list[SimpleNamespace]:
             return [
                 SimpleNamespace(path="s3://bucket1/fragment.lance", file_size_bytes=1)
             ]
 
     class FakeLanceDataset:
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs: Any) -> None:
             captured["dataset_kwargs"] = kwargs
             self.uri = kwargs["uri"]
             self.version = kwargs.get("version", 1)
             self.initial_storage_options = kwargs["storage_options"]
             self._ds = SimpleNamespace(serialized_manifest=lambda: b"manifest")
 
-        def get_fragments(self):
+        def get_fragments(self) -> list[FakeFragment]:
             return [FakeFragment()]
 
-        def scanner(self, **kwargs):
+        def scanner(self, **kwargs: Any) -> FakeScanner:
             captured["scanner_kwargs"] = kwargs
             return FakeScanner()
 
@@ -84,20 +97,20 @@ def test_read_namespace_uses_described_location_and_storage_options(monkeypatch)
     )
 
     def read_fragments_with_retry(
-        fragment_ids,
-        uri,
-        version,
-        storage_options,
-        manifest,
-        namespace_impl,
-        namespace_properties,
-        table_id,
-        base_store_params,
-        namespace_client_managed_versioning,
-        scanner_options,
-        retry_params,
-        with_metadata,
-    ):
+        fragment_ids: Any,
+        uri: Any,
+        version: Any,
+        storage_options: Any,
+        manifest: Any,
+        namespace_impl: Any,
+        namespace_properties: Any,
+        table_id: Any,
+        base_store_params: Any,
+        namespace_client_managed_versioning: Any,
+        scanner_options: Any,
+        retry_params: Any,
+        with_metadata: Any,
+    ) -> Iterator[Any]:
         captured["worker_args"] = {
             "fragment_ids": fragment_ids,
             "uri": uri,
@@ -180,59 +193,61 @@ def test_read_namespace_uses_described_location_and_storage_options(monkeypatch)
     assert captured["worker_args"]["namespace_client_managed_versioning"] is True
 
 
-def test_direct_uri_read_keeps_minio_storage_options_on_worker(monkeypatch):
-    captured = {}
+def test_direct_uri_read_keeps_minio_storage_options_on_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
 
     import lance
 
     class FakeScanner:
-        def count_rows(self):
+        def count_rows(self) -> int:
             return 1
 
     class FakeFragment:
         schema = pa.schema([("value", pa.int64())])
         metadata = SimpleNamespace(id=11)
 
-        def data_files(self):
+        def data_files(self) -> list[SimpleNamespace]:
             return [
                 SimpleNamespace(path="s3://bucket1/direct-fragment", file_size_bytes=1)
             ]
 
     class FakeDataset:
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs: Any) -> None:
             captured["dataset_kwargs"] = kwargs
             self.uri = kwargs["uri"]
             self.version = 4
             self.initial_storage_options = kwargs["storage_options"]
             self._ds = SimpleNamespace(serialized_manifest=lambda: b"direct-manifest")
 
-        def get_fragments(self):
+        def get_fragments(self) -> list[FakeFragment]:
             return [FakeFragment()]
 
-        def scanner(self, **kwargs):
+        def scanner(self, **kwargs: Any) -> FakeScanner:
             captured["scanner_kwargs"] = kwargs
             return FakeScanner()
 
-    def dataset(**kwargs):
+    def dataset(**kwargs: Any) -> FakeDataset:
         return FakeDataset(**kwargs)
 
     monkeypatch.setattr(lance, "dataset", dataset)
 
     def read_fragments_with_retry(
-        fragment_ids,
-        uri,
-        version,
-        storage_options,
-        manifest,
-        namespace_impl,
-        namespace_properties,
-        table_id,
-        base_store_params,
-        namespace_client_managed_versioning,
-        scanner_options,
-        retry_params,
-        with_metadata,
-    ):
+        fragment_ids: Any,
+        uri: Any,
+        version: Any,
+        storage_options: Any,
+        manifest: Any,
+        namespace_impl: Any,
+        namespace_properties: Any,
+        table_id: Any,
+        base_store_params: Any,
+        namespace_client_managed_versioning: Any,
+        scanner_options: Any,
+        retry_params: Any,
+        with_metadata: Any,
+    ) -> Iterator[Any]:
         captured["worker_args"] = {
             "fragment_ids": fragment_ids,
             "uri": uri,
@@ -286,14 +301,14 @@ def test_direct_uri_read_keeps_minio_storage_options_on_worker(monkeypatch):
 
 
 def test_worker_reconstruction_passes_managed_versioning_to_lance_dataset(
-    monkeypatch,
-):
-    captured = {}
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
 
     import lance
 
     class FakeLanceDataset:
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs: Any) -> None:
             captured["dataset_kwargs"] = kwargs
 
     monkeypatch.setattr(lance, "LanceDataset", FakeLanceDataset)
@@ -353,17 +368,24 @@ def test_worker_reconstruction_passes_managed_versioning_to_lance_dataset(
     }
 
 
-def test_namespace_describe_only_receives_integer_dataset_version(monkeypatch):
-    captured = {}
+def test_namespace_describe_only_receives_integer_dataset_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
 
     class DescribeTableRequest:
-        def __init__(self, id, version=None, vend_credentials=None):
+        def __init__(
+            self,
+            id: list[str],
+            version: int | None = None,
+            vend_credentials: bool | None = None,
+        ) -> None:
             self.id = id
             self.version = version
             self.vend_credentials = vend_credentials
 
     class FakeNamespace:
-        def describe_table(self, request):
+        def describe_table(self, request: DescribeTableRequest) -> SimpleNamespace:
             captured["describe_table_request"] = request
             return SimpleNamespace(
                 location="s3://bucket1/tagged_table/",
@@ -371,19 +393,20 @@ def test_namespace_describe_only_receives_integer_dataset_version(monkeypatch):
             )
 
     lance_namespace = ModuleType("lance_namespace")
-    lance_namespace.DescribeTableRequest = DescribeTableRequest
+    # Attribute is set on a dynamically created stub module; mypy cannot model it.
+    lance_namespace.DescribeTableRequest = DescribeTableRequest  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "lance_namespace", lance_namespace)
 
     import lance
 
     class FakeLanceDataset:
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs: Any) -> None:
             captured["dataset_kwargs"] = kwargs
             self.uri = kwargs["uri"]
             self.version = kwargs["version"]
             self.initial_storage_options = kwargs["storage_options"]
 
-        def get_fragments(self):
+        def get_fragments(self) -> list[Any]:
             return []
 
     monkeypatch.setattr(lance, "LanceDataset", FakeLanceDataset)

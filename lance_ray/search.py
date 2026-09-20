@@ -1,18 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+from __future__ import annotations
+
+import inspect
 import logging
 import math
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Union
+import pickle
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, cast
 
 import pyarrow as pa
 import pyarrow.compute as pc
+import ray
 from lance.dataset import LanceDataset
 
+from .field_path import canonical_field_path, resolve_arrow_field_path
 from .pool import get_or_create_pool
 from .utils import (
     get_namespace_kwargs,
-    get_or_create_namespace,
+    resolve_namespace_table,
     validate_uri_or_namespace,
 )
 
@@ -61,31 +68,9 @@ def _get_dataset_storage_options(dataset: LanceDataset) -> dict[str, Any]:
 
 def _get_fragment_id(fragment: Any) -> int:
     try:
-        return fragment.fragment_id
+        return cast(int, fragment.fragment_id)
     except AttributeError:
-        return fragment.metadata.id
-
-
-def _get_index_descriptions(dataset: LanceDataset) -> list[Any]:
-    if hasattr(dataset, "describe_indices"):
-        return dataset.describe_indices()
-
-    descriptions = []
-    for index in dataset.list_indices():
-        descriptions.append(
-            {
-                "name": index["name"],
-                "index_type": index.get("type"),
-                "field_names": index.get("fields", []),
-                "segments": [
-                    {
-                        "uuid": index["uuid"],
-                        "fragment_ids": index.get("fragment_ids", set()),
-                    }
-                ],
-            }
-        )
-    return descriptions
+        return cast(int, fragment.metadata.id)
 
 
 def _index_value(index: Any, name: str, default: Any = None) -> Any:
@@ -106,7 +91,7 @@ def _select_vector_index(
     column: str,
     index_name: Optional[str],
 ) -> Any | None:
-    indices = _get_index_descriptions(dataset)
+    indices = dataset.describe_indices()
     for index in indices:
         name = _index_value(index, "name")
         field_names = _index_value(index, "field_names")
@@ -118,7 +103,7 @@ def _select_vector_index(
                 return index
             continue
 
-        if column in field_names:
+        if column in _canonical_index_field_names(field_names):
             return index
 
     if index_name is not None:
@@ -129,6 +114,16 @@ def _select_vector_index(
         )
 
     return None
+
+
+def _canonical_index_field_names(field_names: Any) -> set[str]:
+    canonical_names = set()
+    for field_name in field_names or []:
+        try:
+            canonical_names.add(canonical_field_path(str(field_name)))
+        except ValueError:
+            canonical_names.add(str(field_name))
+    return canonical_names
 
 
 def _plan_vector_search(
@@ -230,29 +225,38 @@ def _pack_search_plan_units(
     return plans
 
 
+@lru_cache(maxsize=16)
+def _load_pickled_dataset(pickled_dataset: bytes) -> LanceDataset:
+    return cast(LanceDataset, pickle.loads(pickled_dataset))
+
+
+@lru_cache(maxsize=16)
+def _load_pickled_dataset_ref(pickled_dataset_ref: Any) -> LanceDataset:
+    return _load_pickled_dataset(ray.get(pickled_dataset_ref))
+
+
+def _load_worker_dataset(pickled_dataset: Any) -> LanceDataset:
+    if isinstance(pickled_dataset, ray.ObjectRef):
+        return _load_pickled_dataset_ref(pickled_dataset)
+    return _load_pickled_dataset(pickled_dataset)
+
+
+def _share_pickled_dataset_for_workers(pickled_dataset: bytes) -> tuple[Any, bool]:
+    if not ray.is_initialized():
+        return pickled_dataset, False
+    return ray.put(pickled_dataset), True
+
+
 def _execute_vector_search_plan(
     plan: _SearchPlan,
     *,
-    dataset_uri: str,
-    dataset_version: int,
-    storage_options: Optional[dict[str, Any]],
-    block_size: Optional[int],
-    namespace_impl: Optional[str],
-    namespace_properties: Optional[dict[str, str]],
-    table_id: Optional[list[str]],
+    pickled_dataset: Any,
     base_scanner_options: dict[str, Any],
     nearest: dict[str, Any],
     candidate_k: int,
     analyze_plan: bool,
 ) -> pa.Table | _SearchPlanAnalysis:
-    namespace_kwargs = get_namespace_kwargs(
-        namespace_impl, namespace_properties, table_id
-    )
-    dataset = LanceDataset(
-        dataset_uri,
-        version=dataset_version,
-        **_dataset_load_kwargs(storage_options, namespace_kwargs, block_size),
-    )
+    dataset = _load_worker_dataset(pickled_dataset)
 
     if not plan.index_segments:
         return _execute_flat_fallback_vector_search_plan(
@@ -262,6 +266,13 @@ def _execute_vector_search_plan(
             nearest=nearest,
             candidate_k=candidate_k,
             analyze_plan=analyze_plan,
+        )
+
+    if not _scanner_accepts_index_segments(dataset):
+        raise RuntimeError(
+            "The installed pylance scanner does not support index_segments, "
+            "which is required for distributed indexed vector search plans. "
+            "Upgrade pylance or run without an indexed plan."
         )
 
     scanner_options = dict(base_scanner_options)
@@ -282,6 +293,17 @@ def _execute_vector_search_plan(
     if analyze_plan:
         return _SearchPlanAnalysis(plan=plan, analysis=scanner.analyze_plan())
     return scanner.to_table()
+
+
+def _scanner_accepts_index_segments(dataset: LanceDataset) -> bool:
+    try:
+        parameters = inspect.signature(dataset.scanner).parameters
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return True
+    return "index_segments" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 def _execute_flat_fallback_vector_search_plan(
@@ -326,6 +348,11 @@ def _execute_flat_fallback_vector_search_plan(
         _get_nearest_metric(nearest),
     )
     table = table.append_column("_distance", pa.array(distances, type=pa.float32()))
+    # Skip filtering when there are no NaNs to avoid copying the table.
+    invalid = pc.is_nan(table["_distance"])
+    if pc.any(invalid).as_py():
+        # Like Lance, exclude NaN before top-k, but preserve infinite distances.
+        table = table.filter(pc.invert(invalid))
     table = _take_top_k(table, candidate_k)
     if drop_vector_column and vector_scan_column in table.column_names:
         table = table.drop_columns([vector_scan_column])
@@ -371,15 +398,51 @@ def _get_nearest_metric(nearest: dict[str, Any]) -> str:
     return str(metric).lower()
 
 
+def _get_index_metric(dataset: LanceDataset, vector_index: Any) -> str:
+    # Recent index metadata records the metric without opening the index files.
+    details = _index_value(vector_index, "details") or {}
+    metric = details.get("metric_type")
+    if metric:
+        return str(metric).lower()
+
+    # Older persisted indexes may not have a metric in their manifest details.
+    name = _index_value(vector_index, "name")
+    statistics = dataset.stats.index_stats(name)
+    metrics = {
+        str(segment.get("metric_type") or "").lower()
+        for segment in statistics.get("indices", [])
+    }
+    if len(metrics) != 1 or "" in metrics:
+        raise ValueError(
+            f"Cannot determine a consistent distance metric for vector index {name!r}"
+        )
+    return metrics.pop()
+
+
 def _compute_vector_distances(
-    vector_column: pa.ChunkedArray,
+    vector_column: pa.ChunkedArray[Any],
     query: Any,
     metric: str,
 ) -> Any:
     import numpy as np
 
-    matrix = _vector_column_to_numpy(vector_column)
-    query_vector = np.asarray(query, dtype=np.float32)
+    if metric == "hamming":
+        vector_type = vector_column.type
+        if not (
+            pa.types.is_list(vector_type)
+            or pa.types.is_large_list(vector_type)
+            or pa.types.is_fixed_size_list(vector_type)
+        ) or not pa.types.is_uint8(vector_type.value_type):
+            raise ValueError(
+                "Hamming fallback requires a list-like uint8 vector column"
+            )
+        if pc.list_flatten(vector_column).null_count:
+            raise ValueError("Hamming fallback does not support null vector elements")
+        matrix = _vector_column_to_numpy(vector_column, dtype=np.uint8)
+        query_vector = np.asarray(query)
+    else:
+        matrix = _vector_column_to_numpy(vector_column)
+        query_vector = np.asarray(query, dtype=np.float32)
     if query_vector.ndim != 1:
         raise ValueError("nearest['q'] must be a one-dimensional vector")
     if matrix.shape[1] != query_vector.shape[0]:
@@ -389,7 +452,8 @@ def _compute_vector_distances(
         )
 
     if metric in ("l2", "euclidean"):
-        return np.linalg.norm(matrix - query_vector, axis=1).astype(np.float32)
+        # Lance returns squared L2, including on the indexed search path.
+        return np.sum((matrix - query_vector) ** 2, axis=1).astype(np.float32)
     if metric == "cosine":
         query_norm = np.linalg.norm(query_vector)
         row_norms = np.linalg.norm(matrix, axis=1)
@@ -397,14 +461,30 @@ def _compute_vector_distances(
         similarities = np.divide(
             matrix @ query_vector,
             denom,
-            out=np.zeros(matrix.shape[0], dtype=np.float32),
+            out=np.full(matrix.shape[0], np.nan, dtype=np.float32),
             where=denom != 0,
         )
         return (1.0 - similarities).astype(np.float32)
     if metric in ("dot", "ip", "inner_product"):
-        return (-(matrix @ query_vector)).astype(np.float32)
+        # Preserve Lance's offset so indexed and flat candidates are comparable.
+        return (1.0 - matrix @ query_vector).astype(np.float32)
     if metric == "hamming":
-        return np.count_nonzero(matrix != query_vector, axis=1).astype(np.float32)
+        if (
+            query_vector.dtype.kind not in "iu"
+            or np.any(query_vector < 0)
+            or np.any(query_vector > 255)
+        ):
+            raise ValueError(
+                "Hamming query must contain integers in the range 0 to 255"
+            )
+        # Lance stores packed bits in uint8 elements: count differing bits, not
+        # differing bytes. A lookup table avoids expanding the matrix with
+        # unpackbits and works on NumPy versions without bitwise_count.
+        popcounts = np.array(
+            [value.bit_count() for value in range(256)], dtype=np.uint8
+        )
+        xor = np.bitwise_xor(matrix, query_vector.astype(np.uint8))
+        return popcounts[xor].sum(axis=1, dtype=np.uint64).astype(np.float32)
 
     raise ValueError(
         "Unsupported fallback vector search metric "
@@ -412,15 +492,19 @@ def _compute_vector_distances(
     )
 
 
-def _vector_column_to_numpy(vector_column: pa.ChunkedArray) -> Any:
+def _vector_column_to_numpy(
+    vector_column: pa.ChunkedArray[Any], *, dtype: Any = None
+) -> Any:
     import numpy as np
 
+    if dtype is None:
+        dtype = np.float32
     values = vector_column.combine_chunks().to_pylist()
     if not values:
-        return np.empty((0, 0), dtype=np.float32)
+        return np.empty((0, 0), dtype=dtype)
     if any(value is None for value in values):
         raise ValueError("Fallback vector search does not support null vectors")
-    matrix = np.asarray(values, dtype=np.float32)
+    matrix = np.asarray(values, dtype=dtype)
     if matrix.ndim != 2:
         raise ValueError("Fallback vector search requires a list-like vector column")
     return matrix
@@ -484,7 +568,9 @@ def _candidate_k(nearest: dict[str, Any], oversample_factor: float) -> tuple[int
     try:
         global_k = int(nearest["k"])
     except KeyError as exc:
-        raise ValueError("nearest must include 'k' for distributed vector search") from exc
+        raise ValueError(
+            "nearest must include 'k' for distributed vector search"
+        ) from exc
 
     if global_k <= 0:
         raise ValueError(f"nearest['k'] must be positive, got {global_k}")
@@ -497,7 +583,7 @@ def _candidate_k(nearest: dict[str, Any], oversample_factor: float) -> tuple[int
 
 
 def vector_search(
-    uri: Optional[Union[str, "lance.LanceDataset"]] = None,
+    uri: Optional[str | lance.LanceDataset] = None,
     *,
     nearest: dict[str, Any],
     index_name: Optional[str] = None,
@@ -532,6 +618,9 @@ def vector_search(
             and ``k``.  The worker-side ``k`` is raised to at least
             ``k * oversample_factor`` before the driver performs the final
             global top-k merge.
+            If ``metric`` is omitted, fallback plans use the selected index's
+            metric, or L2 when no index exists.  L2 distances are squared and
+            dot distances are ``1 - dot(q, v)``, matching Lance.
         index_name: Optional vector index name to use.  If specified and the
             index cannot be found, ``ValueError`` is raised.  If omitted,
             Lance-Ray uses the first vector index covering ``nearest["column"]``.
@@ -558,9 +647,10 @@ def vector_search(
             Ignored when ``fast_search=True``.
         fast_search: Search only indexed data.  When enabled, Lance-Ray does
             not schedule flat-search fallback plans for unindexed fragments.
-        analyze_plan: Return Lance scanner analyze plans instead of executing
-            the query and returning a table.  The result is a string containing
-            one section per planned shard.
+        analyze_plan: Execute Lance scanner analyze plans and return runtime
+            metrics instead of a result table.  The result has one section per
+            planned shard.  This skips Lance-Ray's fallback distance computation
+            and global top-k merge, but still executes the underlying scanners.
         scanner_options: Additional Lance scanner options.  Lance-Ray manages
             ``nearest``, ``fragments``, ``index_segments``, ``fast_search``,
             ``limit``, and ``offset`` internally, so these options cannot be
@@ -598,47 +688,35 @@ def vector_search(
 
     if isinstance(uri, str | type(None)):
         validate_uri_or_namespace(uri, namespace_impl, table_id)
-        namespace = get_or_create_namespace(namespace_impl, namespace_properties)
-        if namespace is not None and table_id is not None:
-            from lance_namespace import DescribeTableRequest
-
-            describe_response = namespace.describe_table(
-                DescribeTableRequest(id=table_id)
-            )
-            uri = describe_response.location
-            if describe_response.storage_options:
-                merged_storage_options.update(describe_response.storage_options)
+        uri, merged_storage_options = resolve_namespace_table(
+            uri, storage_options, namespace_impl, namespace_properties, table_id
+        )
 
         dataset_uri = uri
         namespace_kwargs = get_namespace_kwargs(
             namespace_impl, namespace_properties, table_id
         )
-        worker_namespace_impl = namespace_impl
-        worker_namespace_properties = namespace_properties
-        worker_table_id = table_id
         dataset = LanceDataset(
             dataset_uri,
-            **_dataset_load_kwargs(merged_storage_options, namespace_kwargs, block_size),
+            **_dataset_load_kwargs(
+                merged_storage_options, namespace_kwargs, block_size
+            ),
         )
     else:
         dataset = uri
-        dataset_uri = dataset.uri
         if not merged_storage_options:
             merged_storage_options.update(_get_dataset_storage_options(dataset))
-        namespace_kwargs = {}
-        worker_namespace_impl = None
-        worker_namespace_properties = None
-        worker_table_id = None
 
     try:
-        dataset.schema.field(column)
+        resolved_column = resolve_arrow_field_path(dataset.schema, column)
     except KeyError as exc:
         available_columns = [field.name for field in dataset.schema]
         raise ValueError(
             f"Column '{column}' not found. Available: {available_columns}"
         ) from exc
+    column = resolved_column.path
+    nearest = {**nearest, "column": column}
 
-    dataset_version = dataset.version
     fragments = dataset.get_fragments()
     if not fragments:
         return pa.table({})
@@ -663,30 +741,43 @@ def vector_search(
     if not plans:
         return pa.table({})
 
-    def run_plan(plan: _SearchPlan) -> pa.Table:
-        return _execute_vector_search_plan(
-            plan,
-            dataset_uri=dataset_uri,
-            dataset_version=dataset_version,
-            storage_options=merged_storage_options,
-            block_size=block_size,
-            namespace_impl=worker_namespace_impl,
-            namespace_properties=worker_namespace_properties,
-            table_id=worker_table_id,
-            base_scanner_options=base_scanner_options,
-            nearest=nearest,
-            candidate_k=candidate_k,
-            analyze_plan=analyze_plan,
-        )
+    if (
+        not analyze_plan
+        and vector_index is not None
+        and not (nearest.get("metric") or nearest.get("distance_type"))
+        and any(not plan.index_segments for plan in plans)
+    ):
+        # Lance infers the index metric for ANN queries. Use the same metric
+        # on flat shards before comparing their distances in the global merge.
+        # Plan analysis returns before computing fallback distances.
+        nearest = {**nearest, "metric": _get_index_metric(dataset, vector_index)}
+
+    pickled_dataset = pickle.dumps(dataset)
 
     try:
         with get_or_create_pool(
             processes=min(num_workers, len(plans)),
             ray_remote_args=ray_remote_args,
         ) as pool:
+            worker_pickled_dataset, _ = _share_pickled_dataset_for_workers(
+                pickled_dataset
+            )
+
+            def run_plan(plan: _SearchPlan) -> pa.Table | _SearchPlanAnalysis:
+                return _execute_vector_search_plan(
+                    plan,
+                    pickled_dataset=worker_pickled_dataset,
+                    base_scanner_options=base_scanner_options,
+                    nearest=nearest,
+                    candidate_k=candidate_k,
+                    analyze_plan=analyze_plan,
+                )
+
             results = pool.map_async(run_plan, plans, chunksize=1).get()
     except Exception as exc:  # pragma: no cover - exercised via integration tests
-        raise RuntimeError(f"Failed to complete distributed vector search: {exc}") from exc
+        raise RuntimeError(
+            f"Failed to complete distributed vector search: {exc}"
+        ) from exc
 
     if analyze_plan:
         return _format_analyze_plan_results(results)

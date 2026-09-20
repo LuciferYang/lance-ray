@@ -2,7 +2,10 @@ import os
 import sys
 from collections.abc import Iterable, Sequence
 from functools import lru_cache
-from typing import Any, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Optional, TypeVar
+
+if TYPE_CHECKING:
+    from lance_namespace import LanceNamespace
 
 T = TypeVar("T")
 
@@ -155,7 +158,7 @@ def validate_uri_or_namespace(
 def _get_cached_namespace(
     namespace_impl: str,
     namespace_properties_tuple: Optional[tuple[tuple[str, str], ...]],
-):
+) -> "LanceNamespace":
     """Internal cached namespace loader. Use get_or_create_namespace() instead."""
     import lance_namespace as ln
 
@@ -168,7 +171,7 @@ def _get_cached_namespace(
 def get_or_create_namespace(
     namespace_impl: Optional[str],
     namespace_properties: Optional[dict[str, str]],
-):
+) -> Optional["LanceNamespace"]:
     """Get or create a cached namespace client.
 
     This function loads a namespace client from cache or creates a new one.
@@ -193,12 +196,69 @@ def get_or_create_namespace(
     return _get_cached_namespace(namespace_impl, namespace_properties_tuple)
 
 
+def resolve_namespace_table(
+    uri: Optional[str],
+    storage_options: Optional[dict[str, Any]],
+    namespace_impl: Optional[str],
+    namespace_properties: Optional[dict[str, str]],
+    table_id: Optional[list[str]],
+) -> tuple[str, dict[str, Any]]:
+    """Resolve a dataset location and merge namespace-vended storage options.
+
+    Resolution rules:
+
+    - When ``uri`` is provided it is returned as-is and the namespace is *not*
+      consulted for location or storage options. The namespace client is still
+      wired separately (via :func:`get_namespace_kwargs`) for credential
+      refresh, so an explicit ``uri`` never picks up another table's
+      credentials. Callers should additionally call
+      :func:`validate_uri_or_namespace` to reject the ``uri`` + namespace
+      combination up front.
+    - When ``uri`` is ``None`` and namespace parameters are present, the table
+      location is fetched from the namespace via ``describe_table`` and any
+      namespace-returned storage options are merged on top of the caller's
+      (namespace values win).
+
+    Returns:
+        A ``(uri, merged_storage_options)`` tuple with a non-None ``uri``.
+
+    Raises:
+        ValueError: If neither ``uri`` nor a resolvable namespace location is
+            available.
+    """
+    merged_storage_options = dict(storage_options or {})
+
+    if uri is not None:
+        return uri, merged_storage_options
+
+    if has_namespace_params(namespace_impl, table_id):
+        namespace = get_or_create_namespace(namespace_impl, namespace_properties)
+        if namespace is not None:
+            from lance_namespace import DescribeTableRequest
+
+            describe_response = namespace.describe_table(
+                DescribeTableRequest(id=table_id)
+            )
+            location = describe_response.location
+            if location is None:
+                raise ValueError("Namespace did not return a 'location' for the table")
+            if describe_response.storage_options:
+                merged_storage_options.update(describe_response.storage_options)
+            return location, merged_storage_options
+
+    raise ValueError("Must provide either 'uri' OR ('namespace_impl' + 'table_id').")
+
+
 def _create_storage_options_provider(
     namespace_impl: Optional[str],
     namespace_properties: Optional[dict[str, str]],
     table_id: Optional[list[str]],
-):
-    """Create a LanceNamespaceStorageOptionsProvider (pylance 4.x only)."""
+) -> Optional[Any]:
+    """Create a LanceNamespaceStorageOptionsProvider (pylance 4.x only).
+
+    Returns ``Any`` because ``LanceNamespaceStorageOptionsProvider`` no longer
+    exists on pylance 5.0+, so it cannot be named as a static type here.
+    """
     if not has_namespace_params(namespace_impl, table_id):
         return None
 
