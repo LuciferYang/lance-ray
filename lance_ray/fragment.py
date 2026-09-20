@@ -4,7 +4,7 @@
 import inspect
 import pickle
 import warnings
-from collections.abc import Callable, Generator, Iterable, Mapping
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 from itertools import chain
 from typing import (
     TYPE_CHECKING,
@@ -12,6 +12,7 @@ from typing import (
     Literal,
     Optional,
     Union,
+    cast,
 )
 
 import pyarrow as pa
@@ -36,14 +37,17 @@ from .utils import (
 
 
 def write_fragment(
-    stream: Iterable[Union[pa.Table, "pd.DataFrame"]],
+    stream: Iterable[Union[pa.Table, "pd.DataFrame", dict[str, Any]]],
     uri: str,
     *,
     schema: Optional[pa.Schema] = None,
     max_rows_per_file: int = 64 * 1024 * 1024,
     max_bytes_per_file: Optional[int] = None,
-    max_rows_per_group: int = 1024,  # Only useful for v1 writer.
+    # Only useful for v1 writer. ``None`` defers to the pylance writer default,
+    # which pylance's own annotation (``int``) does not model.
+    max_rows_per_group: Optional[int] = 1024,
     data_storage_version: Optional[str] = None,
+    enable_stable_row_ids: bool = False,
     storage_options: Optional[dict[str, Any]] = None,
     base_store_params: Optional[dict[str, dict[str, Any]]] = None,
     initial_bases: Optional[list[Any]] = None,
@@ -72,14 +76,17 @@ def write_fragment(
             tbl = pa.Table.from_pydict(first)
             schema = tbl.schema.remove_metadata()
         else:
-            schema = first.schema
+            # Neither a pandas DataFrame nor a dict, so the block is an Arrow
+            # table (a DataFrame cannot reach here: it implies pandas is
+            # importable, which makes ``_PANDAS_AVAILABLE`` true).
+            schema = cast(pa.Table, first).schema
 
     if schema is None or len(schema.names) == 0:
         return []
 
     stream = chain([first], stream_iter)
 
-    def record_batch_converter():
+    def record_batch_converter() -> Iterator[pa.RecordBatch]:
         for block in stream:
             tbl = pd_to_arrow(block, schema)
             yield from tbl.to_batches()
@@ -102,12 +109,9 @@ def write_fragment(
     write_kwargs = get_write_fragments_kwargs(
         namespace_impl, namespace_properties, table_id
     )
+    initial_bases_kwargs: dict[str, Any] = {}
     if initial_bases:
-        initial_bases_kwargs = {
-            "initial_bases": materialize_initial_bases(initial_bases)
-        }
-    else:
-        initial_bases_kwargs = {}
+        initial_bases_kwargs["initial_bases"] = materialize_initial_bases(initial_bases)
 
     optional_write_kwargs = _get_optional_write_fragments_kwargs(
         write_fragments,
@@ -117,22 +121,29 @@ def write_fragment(
         allow_external_blob_outside_bases=allow_external_blob_outside_bases,
     )
 
-    fragments = call_with_retry(
-        lambda: write_fragments(
+    def _write_fragments() -> list["FragmentMetadata"]:
+        # ``write_fragments`` is overloaded on ``return_transaction``. The
+        # version-dependent kwargs are assembled dynamically, which makes mypy
+        # pick the ``return_transaction=True`` overload; ``return_transaction``
+        # is left at its default here, so a list of fragments comes back.
+        return write_fragments(  # type: ignore[return-value]
             reader,
             uri,
             schema=schema,
             max_rows_per_file=max_rows_per_file,
-            max_rows_per_group=max_rows_per_group,
+            # ``None`` means "use the writer default" upstream, even though
+            # pylance annotates the parameter as a plain ``int``.
+            max_rows_per_group=max_rows_per_group,  # type: ignore[arg-type]
             max_bytes_per_file=max_bytes_per_file,
             data_storage_version=data_storage_version,
+            enable_stable_row_ids=enable_stable_row_ids,
             storage_options=storage_options,
             **write_kwargs,
             **initial_bases_kwargs,
             **optional_write_kwargs,
-        ),
-        **retry_params,
-    )
+        )
+
+    fragments = call_with_retry(_write_fragments, **retry_params)
     return [(fragment, schema) for fragment in fragments]
 
 
@@ -280,6 +291,8 @@ class LanceFragmentWriter:
         The version of the data storage format to use. Newer versions are more
         efficient but require newer versions of lance to read.  The default
         (None) will use the 2.0 version.  See the user guide for more details.
+    enable_stable_row_ids : bool, default False
+        Enable stable row IDs for fragments written into a stable-row-ID dataset.
     use_legacy_format : optional, bool, default None
         Deprecated method for setting the data storage version. Use the
         `data_storage_version` parameter instead.
@@ -319,12 +332,15 @@ class LanceFragmentWriter:
         self,
         uri: str,
         *,
-        transform: Optional[Callable[[pa.Table], pa.Table | Generator]] = None,
+        transform: Optional[
+            Callable[[pa.Table], pa.Table | Generator[pa.Table, None, None]]
+        ] = None,
         schema: Optional[pa.Schema] = None,
         max_rows_per_file: int = 1024 * 1024,
         max_bytes_per_file: Optional[int] = None,
         max_rows_per_group: Optional[int] = None,  # Only useful for v1 writer.
         data_storage_version: Optional[str] = None,
+        enable_stable_row_ids: bool = False,
         use_legacy_format: Optional[bool] = False,
         storage_options: Optional[dict[str, Any]] = None,
         base_store_params: Optional[dict[str, dict[str, Any]]] = None,
@@ -363,6 +379,7 @@ class LanceFragmentWriter:
         self.max_rows_per_file = max_rows_per_file
         self.max_bytes_per_file = max_bytes_per_file
         self.data_storage_version = data_storage_version
+        self.enable_stable_row_ids = enable_stable_row_ids
         self.storage_options = storage_options
         self.base_store_params = base_store_params
         self.initial_bases = normalize_initial_bases(initial_bases)
@@ -374,11 +391,14 @@ class LanceFragmentWriter:
         self.table_id = table_id
         self.retry_params = retry_params
 
-    def __call__(self, batch: Union[pa.Table, "pd.DataFrame", dict]) -> pa.Table:
+    def __call__(
+        self, batch: Union[pa.Table, "pd.DataFrame", dict[str, Any]]
+    ) -> pa.Table:
         """Write a Batch to the Lance fragment."""
         # Convert dict/numpy arrays to pyarrow table if needed
+        table: pa.Table
         if isinstance(batch, dict):
-            batch = pa.Table.from_pydict(batch)
+            table = pa.Table.from_pydict(batch)
         else:
             # Only convert when the input is an actual pandas DataFrame.
             # Some objects (including pyarrow.Table) may implement the
@@ -387,25 +407,33 @@ class LanceFragmentWriter:
             # incorrectly routes them through `Table.from_pandas` and causes
             # errors. Perform a strict isinstance check instead.
             try:
-                from pandas import DataFrame as _PandasDataFrame  # type: ignore
+                from pandas import DataFrame as _PandasDataFrame
             except Exception:
-                _PandasDataFrame = None  # type: ignore
+                _PandasDataFrame = None  # type: ignore[assignment,misc]
 
             if _PandasDataFrame is not None and isinstance(batch, _PandasDataFrame):
-                batch = pa.Table.from_pandas(batch)
+                table = pa.Table.from_pandas(batch)
+            else:
+                # Anything else is handed to the transform unchanged, as an
+                # Arrow table is the only remaining documented block type.
+                table = cast(pa.Table, batch)
 
-        transformed = self.transform(batch)
-        if not isinstance(transformed, Generator):
-            transformed = (t for t in [transformed])
+        transformed = self.transform(table)
+        blocks: Iterable[pa.Table]
+        if isinstance(transformed, Generator):
+            blocks = transformed
+        else:
+            blocks = (t for t in [transformed])
 
         fragments = write_fragment(
-            transformed,
+            blocks,
             self.uri,
             schema=self.schema,
             max_rows_per_file=self.max_rows_per_file,
             max_rows_per_group=self.max_rows_per_group,
             max_bytes_per_file=self.max_bytes_per_file,
             data_storage_version=self.data_storage_version,
+            enable_stable_row_ids=self.enable_stable_row_ids,
             storage_options=self.storage_options,
             base_store_params=self.base_store_params,
             initial_bases=self.initial_bases,
