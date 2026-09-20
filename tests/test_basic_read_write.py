@@ -400,7 +400,7 @@ class TestAddColumns:
         assert df.columns.tolist() == ["id", "name", "age", "score", "new_column"]
         assert (df["new_column"] == df["score"] * 2).all()
 
-    def test_add_columns_rejects_filter(self, temp_dir):
+    def test_add_columns_rejects_filter(self, temp_dir: str) -> None:
         """A non-None filter must raise instead of being silently ignored."""
         path = Path(temp_dir) / "add_columns_filter.lance"
         with pytest.raises(NotImplementedError, match="filter"):
