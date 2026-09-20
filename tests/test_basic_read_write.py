@@ -3,7 +3,9 @@
 import os
 import sys
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import lance
 import lance_ray as lr
@@ -13,6 +15,10 @@ import ray
 from ray.data import Dataset
 
 import pandas as pd
+from _utils import (
+    fragment_write_options_skip_reason,
+    missing_fragment_write_options,
+)
 
 sys.path.insert(
     0, str(Path(__file__).resolve().parents[1] / "lance" / "python" / "python")
@@ -20,7 +26,7 @@ sys.path.insert(
 
 
 @pytest.fixture
-def sample_data():
+def sample_data() -> pd.DataFrame:
     """Create sample data for testing."""
     return pd.DataFrame(
         {
@@ -33,14 +39,14 @@ def sample_data():
 
 
 @pytest.fixture
-def temp_dir():
+def temp_dir() -> Iterator[str]:
     """Create a temporary directory for testing."""
     with tempfile.TemporaryDirectory() as temp_dir:
         yield temp_dir
 
 
 @pytest.fixture
-def sample_dataset(sample_data):
+def sample_dataset(sample_data: pd.DataFrame) -> Dataset:
     """Create a Ray Dataset from sample data."""
     return ray.data.from_pandas(sample_data)
 
@@ -48,7 +54,7 @@ def sample_dataset(sample_data):
 class TestWriteLance:
     """Test cases for write_lance function."""
 
-    def test_write_lance_basic(self, sample_dataset, temp_dir):
+    def test_write_lance_basic(self, sample_dataset: Dataset, temp_dir: str) -> None:
         """Test basic write functionality."""
         path = Path(temp_dir) / "basic_write.lance"
 
@@ -57,29 +63,70 @@ class TestWriteLance:
         assert path.exists()
         assert path.is_dir()
 
-    def test_write_lance_with_schema(self, temp_dir):
+    def test_write_lance_with_stable_row_ids(
+        self, sample_dataset: Dataset, temp_dir: str
+    ) -> None:
+        path = Path(temp_dir) / "stable_row_ids.lance"
+
+        lr.write_lance(
+            sample_dataset,
+            str(path),
+            enable_stable_row_ids=True,
+        )
+
+        assert lance.dataset(str(path)).has_stable_row_ids
+
+    def test_write_lance_with_schema(self, temp_dir: str) -> None:
         """Test write with explicit schema."""
         path = Path(temp_dir) / "schema_write.lance"
 
         data = pd.DataFrame({"col1": [1, 2, 3], "col2": ["a", "b", "c"]})
         dataset = ray.data.from_pandas(data)
 
-        schema = pa.schema(
-            [pa.field("col1", pa.int64()), pa.field("col2", pa.string())]
-        )
+        schema_fields: list[pa.Field[Any]] = [
+            pa.field("col1", pa.int64()),
+            pa.field("col2", pa.string()),
+        ]
+        schema = pa.schema(schema_fields)
 
         lr.write_lance(dataset, str(path), schema=schema)
         assert path.exists()
 
-    def test_write_lance_invalid_input(self, temp_dir):
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_write_lance_with_max_bytes_per_file(
+        self, temp_dir: str, stream: bool
+    ) -> None:
+        path = Path(temp_dir) / f"max_bytes_{stream}.lance"
+        schema = pa.schema([pa.field("value", pa.string())])
+        batches = [
+            pa.record_batch([pa.array(["0" * 1024] * (1024 * 8))], schema=schema),
+            pa.record_batch([pa.array(["1" * 1024] * (1024 * 8))], schema=schema),
+        ]
+        table = pa.Table.from_batches(batches)
+
+        lr.write_lance(
+            ray.data.from_arrow(table),
+            str(path),
+            min_rows_per_file=512,
+            max_rows_per_file=table.num_rows,
+            max_bytes_per_file=1024,
+            stream=stream,
+            batch_size=table.num_rows,
+        )
+
+        dataset = lance.dataset(str(path))
+        assert dataset.count_rows() == table.num_rows
+        assert len(dataset.get_fragments()) > 1
+
+    def test_write_lance_invalid_input(self, temp_dir: str) -> None:
         """Test error handling for invalid inputs."""
         path = Path(temp_dir) / "invalid.lance"
 
         with pytest.raises((ValueError, AttributeError, TypeError)):
-            lr.write_lance(None, str(path))  # type: ignore
+            lr.write_lance(None, str(path))  # type: ignore[arg-type]
 
-    def test_write_with_pandas_map_batches(self, temp_dir):
-        def map_fn(row):
+    def test_write_with_pandas_map_batches(self, temp_dir: str) -> None:
+        def map_fn(row: dict[str, Any]) -> dict[str, Any]:
             return {
                 "id": row["id"],
                 "name": row["name"],
@@ -88,18 +135,17 @@ class TestWriteLance:
                 "extra": None,
             }
 
-        def to_pd(batch: pd.DataFrame):
+        def to_pd(batch: pd.DataFrame) -> pd.DataFrame:
             return batch
 
-        schema = pa.schema(
-            [
-                pa.field("id", pa.int64()),
-                pa.field("name", pa.string()),
-                pa.field("age", pa.int32()),
-                pa.field("score", pa.float64()),
-                pa.field("extra", pa.string()),
-            ]
-        )
+        schema_fields: list[pa.Field[Any]] = [
+            pa.field("id", pa.int64()),
+            pa.field("name", pa.string()),
+            pa.field("age", pa.int32()),
+            pa.field("score", pa.float64()),
+            pa.field("extra", pa.string()),
+        ]
+        schema = pa.schema(schema_fields)
         data = pd.DataFrame(
             {
                 "id": [1, 2, 3, 4, 5],
@@ -122,18 +168,65 @@ class TestWriteLance:
         tbl = ds.to_table()
         assert set(data["name"].tolist()) == set(tbl["name"].to_pylist())
 
+    def test_write_lance_preserves_nested_struct_fields(self, temp_dir: str) -> None:
+        path = Path(temp_dir) / "nested_struct.lance"
+        schema_fields: list[pa.Field[Any]] = [
+            pa.field("id", pa.int64()),
+            pa.field(
+                "meta",
+                pa.struct(
+                    [
+                        pa.field("userId", pa.string()),
+                        pa.field("a.b", pa.string()),
+                    ]
+                ),
+            ),
+        ]
+        schema = pa.schema(schema_fields)
+        table = pa.Table.from_arrays(
+            [
+                pa.array([1, 2], type=pa.int64()),
+                pa.array(
+                    [
+                        {"userId": "u1", "a.b": "literal dot one"},
+                        {"userId": "u2", "a.b": "literal dot two"},
+                    ],
+                    type=schema.field("meta").type,
+                ),
+            ],
+            schema=schema,
+        )
+
+        lr.write_lance(
+            ray.data.from_arrow(table),
+            str(path),
+            min_rows_per_file=1,
+            max_rows_per_file=1,
+        )
+
+        ds = lance.dataset(str(path))
+        assert ds.schema == schema
+        projected = lr.read_lance(str(path), columns=["meta.userId"]).take_all()
+        literal_dot = lr.read_lance(str(path), columns=["meta.`a.b`"]).take_all()
+
+        assert projected == [{"meta.userId": "u1"}, {"meta.userId": "u2"}]
+        assert literal_dot == [
+            {"meta.`a.b`": "literal dot one"},
+            {"meta.`a.b`": "literal dot two"},
+        ]
+
 
 class TestReadLance:
     """Test cases for read_lance function."""
 
     @pytest.fixture
-    def lance_dataset_path(self, sample_dataset, temp_dir):
+    def lance_dataset_path(self, sample_dataset: Dataset, temp_dir: str) -> str:
         """Create a Lance dataset for reading tests."""
         path = Path(temp_dir) / "test_dataset.lance"
         lr.write_lance(sample_dataset, str(path))
         return str(path)
 
-    def test_read_lance_basic(self, lance_dataset_path):
+    def test_read_lance_basic(self, lance_dataset_path: str) -> None:
         """Test basic read functionality."""
         dataset = lr.read_lance(lance_dataset_path)
 
@@ -143,7 +236,7 @@ class TestReadLance:
         assert len(df) == 5
         assert list(df.columns) == ["id", "name", "age", "score"]
 
-    def test_read_lance_with_columns(self, lance_dataset_path):
+    def test_read_lance_with_columns(self, lance_dataset_path: str) -> None:
         """Test reading specific columns."""
         dataset = lr.read_lance(lance_dataset_path, columns=["id", "name"])
 
@@ -151,7 +244,7 @@ class TestReadLance:
         assert list(df.columns) == ["id", "name"]
         assert len(df) == 5
 
-    def test_read_lance_with_filter(self, lance_dataset_path):
+    def test_read_lance_with_filter(self, lance_dataset_path: str) -> None:
         """Test reading with filter."""
         dataset = lr.read_lance(lance_dataset_path, filter="age > 30")
 
@@ -159,7 +252,7 @@ class TestReadLance:
         assert len(df) == 3
         assert all(df["age"] > 30)
 
-    def test_read_lance_columns_and_filter(self, lance_dataset_path):
+    def test_read_lance_columns_and_filter(self, lance_dataset_path: str) -> None:
         """Test reading with both columns and filter."""
         dataset = lr.read_lance(
             lance_dataset_path, columns=["name", "age"], filter="age >= 35"
@@ -170,14 +263,14 @@ class TestReadLance:
         assert len(df) == 3
         assert all(df["age"] >= 35)
 
-    def test_read_lance_filter_and_count(self, lance_dataset_path):
+    def test_read_lance_filter_and_count(self, lance_dataset_path: str) -> None:
         """Test reading filter and count."""
         dataset = lr.read_lance(
             lance_dataset_path, columns=["name", "age"], filter="age >= 35"
         )
         assert dataset.count() == 3
 
-    def test_read_lance_nonexistent_path(self):
+    def test_read_lance_nonexistent_path(self) -> None:
         """Test reading from non-existent path."""
         with pytest.raises((FileNotFoundError, OSError, Exception)):
             lr.read_lance("/path/that/does/not/exist")
@@ -186,7 +279,9 @@ class TestReadLance:
 class TestReadWrite:
     """Integration tests for read and write operations."""
 
-    def test_write_then_read_roundtrip(self, sample_data, temp_dir):
+    def test_write_then_read_roundtrip(
+        self, sample_data: pd.DataFrame, temp_dir: str
+    ) -> None:
         """Test writing data and then reading it back."""
         path = Path(temp_dir) / "roundtrip.lance"
 
@@ -204,7 +299,7 @@ class TestReadWrite:
 
         pd.testing.assert_frame_equal(original_sorted, read_sorted)
 
-    def test_append_mode(self, sample_data, temp_dir):
+    def test_append_mode(self, sample_data: pd.DataFrame, temp_dir: str) -> None:
         """Test append mode with read verification."""
         path = Path(temp_dir) / "append_test.lance"
 
@@ -230,7 +325,7 @@ class TestReadWrite:
 
         assert len(full_df) == 5  # 3 initial + 2 appended
 
-    def test_overwrite_mode(self, sample_dataset, temp_dir):
+    def test_overwrite_mode(self, sample_dataset: Dataset, temp_dir: str) -> None:
         """Test different write modes."""
         path = Path(temp_dir) / "modes_test.lance"
 
@@ -263,7 +358,9 @@ class TestReadWrite:
         overwritten_df = overwritten_dataset.to_pandas()
         assert len(overwritten_df) == 2  # Should have 2 rows after overwrite
 
-    def test_read_lance_with_fragment_ids(self, sample_dataset, temp_dir):
+    def test_read_lance_with_fragment_ids(
+        self, sample_dataset: Dataset, temp_dir: str
+    ) -> None:
         """Test reading with fragment IDs."""
         path = Path(temp_dir) / "fragment_ids_test.lance"
         lr.write_lance(
@@ -276,7 +373,7 @@ class TestReadWrite:
 class TestAddColumns:
     """Test cases for add_columns function."""
 
-    def test_add_columns_basic(self, sample_dataset, temp_dir):
+    def test_add_columns_basic(self, sample_dataset: Dataset, temp_dir: str) -> None:
         """Test basic add columns functionality."""
         path = Path(temp_dir) / "add_columns_test.lance"
         lr.write_lance(
@@ -307,7 +404,9 @@ class TestAddColumns:
 class TestNamespaceReadWrite:
     """Test cases for read/write with DirectoryNamespace."""
 
-    def test_write_and_read_with_directory_namespace(self, sample_data, temp_dir):
+    def test_write_and_read_with_directory_namespace(
+        self, sample_data: pd.DataFrame, temp_dir: str
+    ) -> None:
         """Test write and read using DirectoryNamespace."""
         table_id = ["test_table"]
 
@@ -335,7 +434,7 @@ class TestNamespaceReadWrite:
 class TestDatasetOptions:
     """Test cases for dataset options in LanceDataset."""
 
-    def test_dataset_with_version(self, sample_dataset, temp_dir):
+    def test_dataset_with_version(self, sample_dataset: Dataset, temp_dir: str) -> None:
         """Test dataset options like version and block size."""
         path = Path(temp_dir) / "dataset_options_test.lance"
         lr.write_lance(sample_dataset, str(path))
@@ -366,12 +465,12 @@ try:
     from lance import DatasetBasePath, blob_array, blob_field
 except Exception:
 
-    class _Missing:  # type: ignore[no-redef]
+    class _Missing:
         pass
 
-    DatasetBasePath = _Missing
-    blob_array = _Missing
-    blob_field = _Missing
+    DatasetBasePath = _Missing  # type: ignore[assignment,misc]
+    blob_array = _Missing  # type: ignore[assignment]
+    blob_field = _Missing  # type: ignore[assignment]
 
 
 class TestMultiBaseLayout:
@@ -394,7 +493,7 @@ class TestMultiBaseLayout:
         ``Duplicate base path ID 0`` error.
     """
 
-    def test_multiple_initial_bases_without_explicit_id(self, temp_dir):
+    def test_multiple_initial_bases_without_explicit_id(self, temp_dir: str) -> None:
         """Multiple DatasetBasePath objects without explicit id should not collide.
 
         When the user provides two (or more) ``DatasetBasePath`` objects
@@ -431,14 +530,18 @@ class TestMultiBaseLayout:
         ds = lance.dataset(uri)
         assert ds.count_rows() == 3
 
-        base_paths = ds._ds.base_paths()
+        base_paths = ds._ds.base_paths()  # type: ignore[attr-defined]
         assert len(base_paths) >= 2
         base_ids = list(base_paths.keys())
         assert len(set(base_ids)) == len(base_ids), (
             f"Base path IDs must be unique, got: {base_paths}"
         )
 
-    def test_multiple_initial_bases_with_blob_v2(self, temp_dir):
+    @pytest.mark.skipif(
+        bool(missing_fragment_write_options("base_store_params")),
+        reason=fragment_write_options_skip_reason("base_store_params"),
+    )
+    def test_multiple_initial_bases_with_blob_v2(self, temp_dir: str) -> None:
         """Multi-base write/read with blob v2 columns and no explicit IDs.
 
         This is the full end-to-end scenario: blob data lives across
@@ -469,7 +572,7 @@ class TestMultiBaseLayout:
         )
         ray_ds = ray.data.from_arrow(table)
 
-        base_store_params = {
+        base_store_params: dict[str, dict[str, Any]] = {
             base1_dir.as_uri(): {},
             base2_dir.as_uri(): {},
         }
@@ -490,14 +593,14 @@ class TestMultiBaseLayout:
         ds = lance.dataset(uri, base_store_params=base_store_params)
         assert ds.count_rows() == 2
 
-        base_paths = ds._ds.base_paths()
+        base_paths = ds._ds.base_paths()  # type: ignore[attr-defined]
         assert len(base_paths) >= 2
         base_ids = list(base_paths.keys())
         assert len(set(base_ids)) == len(base_ids), (
             f"Base path IDs must be unique, got: {base_paths}"
         )
 
-    def test_explicit_ids_are_preserved(self, temp_dir):
+    def test_explicit_ids_are_preserved(self, temp_dir: str) -> None:
         """When the user provides explicit IDs, they must be preserved."""
         base1_dir = Path(temp_dir) / "explicit_base1"
         base2_dir = Path(temp_dir) / "explicit_base2"
@@ -527,11 +630,11 @@ class TestMultiBaseLayout:
         ds = lance.dataset(uri)
         assert ds.count_rows() == 2
 
-        base_paths = ds._ds.base_paths()
+        base_paths = ds._ds.base_paths()  # type: ignore[attr-defined]
         assert 5 in base_paths
         assert 10 in base_paths
 
-    def test_mixed_explicit_and_implicit_ids(self, temp_dir):
+    def test_mixed_explicit_and_implicit_ids(self, temp_dir: str) -> None:
         """One base with explicit id, one without — no collision."""
         base1_dir = Path(temp_dir) / "mixed_base1"
         base2_dir = Path(temp_dir) / "mixed_base2"
@@ -561,14 +664,14 @@ class TestMultiBaseLayout:
         ds = lance.dataset(uri)
         assert ds.count_rows() == 2
 
-        base_paths = ds._ds.base_paths()
+        base_paths = ds._ds.base_paths()  # type: ignore[attr-defined]
         assert 3 in base_paths
         base_ids = list(base_paths.keys())
         assert len(set(base_ids)) == len(base_ids), (
             f"Base path IDs must be unique, got: {base_paths}"
         )
 
-    def test_dataset_root_base_gets_id_zero(self, temp_dir):
+    def test_dataset_root_base_gets_id_zero(self, temp_dir: str) -> None:
         """A base with is_dataset_root=True should receive id=0."""
         base1_dir = Path(temp_dir) / "root_base"
         base2_dir = Path(temp_dir) / "extra_base"
@@ -600,5 +703,5 @@ class TestMultiBaseLayout:
         ds = lance.dataset(uri)
         assert ds.count_rows() == 2
 
-        base_paths = ds._ds.base_paths()
+        base_paths = ds._ds.base_paths()  # type: ignore[attr-defined]
         assert 0 in base_paths
