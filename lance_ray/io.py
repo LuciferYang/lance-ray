@@ -4,7 +4,7 @@ I/O operations for Lance-Ray integration.
 
 import pickle
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -22,6 +22,7 @@ from .utils import (
     has_namespace_params,
     materialize_initial_bases,
     normalize_initial_bases,
+    resolve_namespace_table,
     validate_uri_or_namespace,
 )
 
@@ -34,6 +35,14 @@ if TYPE_CHECKING:
         | ReaderLike
         | Callable[[pa.RecordBatch], pa.RecordBatch]
     )
+
+    #: ``add_columns_from`` hands each batch to the transform as a mapping of
+    #: column name to a list of Python values, and expects only the new columns
+    #: back. See the ``add_columns_from`` docstring.
+    BatchDictTransform = Callable[
+        [dict[str, list[Any]]], dict[str, Any] | pa.RecordBatch | pa.Table
+    ]
+    TransformFromType = dict[str, str] | BatchUDF | ReaderLike | BatchDictTransform
 
 
 def read_lance(
@@ -135,11 +144,14 @@ def read_lance(
         with_metadata=with_metadata,
     )
 
-    return read_datasource(
-        datasource=datasource,
-        ray_remote_args=ray_remote_args or {},
-        concurrency=concurrency,
-        override_num_blocks=override_num_blocks,
+    return cast(
+        Dataset,
+        read_datasource(
+            datasource=datasource,
+            ray_remote_args=ray_remote_args or {},
+            concurrency=concurrency,
+            override_num_blocks=override_num_blocks,
+        ),
     )
 
 
@@ -152,7 +164,9 @@ def write_lance(
     mode: Literal["create", "append", "overwrite"] = "create",
     min_rows_per_file: int = 1024 * 1024,
     max_rows_per_file: int = 64 * 1024 * 1024,
+    max_bytes_per_file: Optional[int] = None,
     data_storage_version: Optional[str] = None,
+    enable_stable_row_ids: bool = False,
     storage_options: Optional[dict[str, Any]] = None,
     base_store_params: Optional[dict[str, dict[str, Any]]] = None,
     initial_bases: Optional[list[Any]] = None,
@@ -214,10 +228,14 @@ def write_lance(
             dropped, while with ``stream=True`` they raise a schema-mismatch error.
         min_rows_per_file: The minimum number of rows per file.
         max_rows_per_file: The maximum number of rows per file.
+        max_bytes_per_file: The maximum number of bytes per file. This is a soft
+            limit. If not provided, the PyLance default is used.
         data_storage_version: The version of the data storage format to use. Newer versions are more
             efficient but require newer versions of lance to read.  The default is
             "legacy" which will use the legacy v1 version.  See the user guide
             for more details.
+        enable_stable_row_ids: Enable stable row IDs for the dataset and all
+            fragments written by this operation. Default is False.
         storage_options: The storage options for the writer. Default is None.
         base_store_params: Runtime-only storage options keyed by registered
             base path URI. Used for BlobV2 references that live outside the
@@ -264,7 +282,9 @@ def write_lance(
             mode=mode,
             min_rows_per_file=min_rows_per_file,
             max_rows_per_file=max_rows_per_file,
+            max_bytes_per_file=max_bytes_per_file,
             data_storage_version=data_storage_version,
+            enable_stable_row_ids=enable_stable_row_ids,
             storage_options=storage_options,
             base_store_params=base_store_params,
             initial_bases=initial_bases,
@@ -299,7 +319,7 @@ def write_lance(
     dest_uri: str = uri
     dest_exists = False
     dest_version: Optional[int] = None
-    base_store_params_kwargs = {}
+    base_store_params_kwargs: dict[str, Any] = {}
     if base_store_params:
         base_store_params_kwargs = {"base_store_params": base_store_params}
 
@@ -332,7 +352,13 @@ def write_lance(
         batch_size=effective_batch_size, batch_format="pyarrow"
     ):
         # Convert to pyarrow.Table if needed.
-        tbl = batch if isinstance(batch, pa.Table) else pa.Table.from_pydict(batch)
+        # ``batch_format="pyarrow"`` yields ``pa.Table``; the mapping branch is
+        # only a safeguard for older Ray releases.
+        tbl = (
+            batch
+            if isinstance(batch, pa.Table)
+            else pa.Table.from_pydict(cast("dict[str, Any]", batch))
+        )
 
         # Apply resume_rows skipping across batches.
         if resume_rows > rows_seen:
@@ -359,9 +385,11 @@ def write_lance(
             uri=dest_uri,
             schema=schema,  # if None, writer infers from first batch (preserves Arrow metadata)
             max_rows_per_file=max_rows_per_file,
+            max_bytes_per_file=max_bytes_per_file,
             max_rows_per_group=min_rows_per_file,  # keep naming aligned with v1 semantics
             data_storage_version=data_storage_version,
             mode=fragment_mode,
+            enable_stable_row_ids=enable_stable_row_ids,
             storage_options=storage_options,
             base_store_params=base_store_params,
             initial_bases=fragment_initial_bases,
@@ -375,14 +403,20 @@ def write_lance(
         frag_tbl = writer(tbl)
         fragments: list[Any] = []
         schema_obj: Optional[pa.Schema] = None
-        frag_col = frag_tbl.column("fragment").to_pylist()
-        sch_col = frag_tbl.column("schema").to_pylist()
+        frag_col = cast("list[bytes]", frag_tbl.column("fragment").to_pylist())
+        sch_col = cast("list[bytes]", frag_tbl.column("schema").to_pylist())
         for frag_bytes, schema_bytes in zip(frag_col, sch_col, strict=False):
             fragment = pickle.loads(frag_bytes)
             fragments.append(fragment)
             schema_obj = pickle.loads(schema_bytes)
 
+        if schema_obj is None:
+            raise RuntimeError(
+                "LanceFragmentWriter returned no fragments for a non-empty batch"
+            )
+
         # Commit after each batch.
+        op: LanceOperation.BaseOperation
         if not first_commit_done:
             # First commit: respect mode.
             if mode in ("create", "overwrite") or not dest_exists:
@@ -400,6 +434,7 @@ def write_lance(
                     op,
                     read_version=None,
                     storage_options=storage_options,
+                    enable_stable_row_ids=enable_stable_row_ids,
                     **base_store_params_kwargs,
                 )
                 first_commit_done = True
@@ -420,6 +455,7 @@ def write_lance(
                     op,
                     read_version=dest_version,
                     storage_options=storage_options,
+                    enable_stable_row_ids=enable_stable_row_ids,
                     **base_store_params_kwargs,
                 )
                 first_commit_done = True
@@ -448,6 +484,7 @@ def write_lance(
                     op,
                     read_version=None,
                     storage_options=storage_options,
+                    enable_stable_row_ids=enable_stable_row_ids,
                     **base_store_params_kwargs,
                 )
                 first_commit_done = True
@@ -459,6 +496,7 @@ def write_lance(
                 op,
                 read_version=dest_version,
                 storage_options=storage_options,
+                enable_stable_row_ids=enable_stable_row_ids,
                 **base_store_params_kwargs,
             )
             try:
@@ -485,12 +523,12 @@ def _handle_fragment(
     namespace_impl: Optional[str] = None,
     namespace_properties: Optional[dict[str, str]] = None,
     table_id: Optional[list[str]] = None,
-):
+) -> Callable[[int], tuple[bytes, bytes]]:
     """
     Handle a fragment of a Lance dataset.
     """
 
-    def func(fragment_id: int):
+    def func(fragment_id: int) -> tuple[bytes, bytes]:
         namespace_kwargs = get_namespace_kwargs(
             namespace_impl, namespace_properties, table_id
         )
@@ -502,6 +540,8 @@ def _handle_fragment(
             **namespace_kwargs,
         )
         fragment = lance_ds.get_fragment(fragment_id)
+        if fragment is None:
+            raise ValueError(f"Fragment {fragment_id} does not exist in {uri}")
         fragment_meta, schema = fragment.merge_columns(
             transform, read_columns, batch_size, reader_schema
         )
@@ -511,7 +551,7 @@ def _handle_fragment(
 
 
 def add_columns(
-    uri: str,
+    uri: Optional[str] = None,
     *,
     transform: "TransformType",
     filter: Optional[str] = None,
@@ -545,7 +585,9 @@ def add_columns(
         >>> lr.add_columns("/tmp/data/", transform=double_score, concurrency=2)
 
     Args:
-        uri: The path to the destination Lance dataset.
+        uri: The path to the destination Lance dataset. If omitted, provide
+            ``namespace_impl`` and ``table_id`` to resolve the location from
+            the namespace.
         transform: The transform to apply to the dataset. It support a lot of types,
             see `LanceDB API doc https://lancedb.github.io/lance-python-doc/data-evolution.html ` for more details.
         filter: The filter to apply to the dataset. It is not supported yet, will be
@@ -567,7 +609,15 @@ def add_columns(
         batch_size: The batch size to use for the reader.
         concurrency: The number of processes to use for the pool.
     """
-    storage_options = storage_options or {}
+    validate_uri_or_namespace(uri, namespace_impl, table_id)
+
+    uri, storage_options = resolve_namespace_table(
+        uri,
+        storage_options,
+        namespace_impl,
+        namespace_properties,
+        table_id,
+    )
 
     namespace_kwargs = get_namespace_kwargs(
         namespace_impl, namespace_properties, table_id
@@ -630,7 +680,12 @@ def add_columns(
 
 
 def _derive_fragid_from_rowaddr(batch: pa.Table) -> pa.Table:
-    fragid = pc.cast(pc.shift_right(batch.column("_rowaddr"), 32), pa.uint64())
+    # pyarrow-stubs has no overload for shifting an array by a plain Python
+    # int, and types the result as a scalar.
+    fragid = cast(
+        "pa.ChunkedArray[Any]",
+        pc.cast(pc.shift_right(batch.column("_rowaddr"), 32), pa.uint64()),
+    )
     return batch.append_column("_fragid", fragid)
 
 
@@ -681,6 +736,8 @@ def _commit_with_retry(
                     raise
                 except Exception:
                     pass
+    if last_exc is None:  # pragma: no cover - the loop always sets it
+        raise RuntimeError("Commit failed without raising an exception")
     raise last_exc
 
 
@@ -710,9 +767,9 @@ def _fill_null_fragment(
 
 
 def add_columns_from(
-    uri: str,
+    uri: Optional[str] = None,
     *,
-    transform: "TransformType",
+    transform: "TransformFromType",
     read_columns: Optional[list[str]] = None,
     read_version: Optional[int | str] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
@@ -746,7 +803,9 @@ def add_columns_from(
         >>> lr.add_columns_from("/tmp/data/", transform=compute_name_len)
 
     Args:
-        uri: The path to the destination Lance dataset.
+        uri: The path to the destination Lance dataset. If omitted, provide
+            ``namespace_impl`` and ``table_id`` to resolve the location from
+            the namespace.
         transform: The transform to apply to each batch. It receives a dict
             mapping column names to Python lists (metadata columns like
             ``_rowaddr`` are excluded) and must return only the new columns
@@ -766,6 +825,8 @@ def add_columns_from(
     if read_version is not None:
         dataset_options["version"] = read_version
 
+    validate_uri_or_namespace(uri, namespace_impl, table_id)
+
     ray_ds = read_lance(
         uri,
         columns=read_columns,
@@ -783,6 +844,7 @@ def add_columns_from(
     def _wrap_transform(batch: pa.Table) -> pa.Table:
         rowaddr = batch.column("_rowaddr") if "_rowaddr" in batch.column_names else None
 
+        new_cols: dict[str, Any] | pa.Table | pa.RecordBatch | Any
         if isinstance(transform, dict):
             new_cols = transform
         elif isinstance(transform, BatchUDF):
@@ -808,7 +870,9 @@ def add_columns_from(
                 batch.schema, batch.to_batches(max_chunksize=batch_size)
             )
             result_batches = []
-            for rb in transform(reader):
+            # A reader-consuming callable is not part of ``TransformType``; the
+            # ``callable()`` branch above only covers the record-batch variant.
+            for rb in transform(reader):  # type: ignore[operator]
                 result_batches.append(rb)
             new_cols = pa.Table.from_batches(result_batches)
 
@@ -824,7 +888,9 @@ def add_columns_from(
 
         return new_table
 
-    ray_ds = ray_ds.map_batches(_wrap_transform, batch_format="pyarrow")
+    # ``batch_format="pyarrow"`` means the callable only ever sees ``pa.Table``,
+    # which is narrower than the union Ray's signature declares.
+    ray_ds = ray_ds.map_batches(_wrap_transform, batch_format="pyarrow")  # type: ignore[arg-type]
 
     merge_columns_from(
         uri,
@@ -840,8 +906,8 @@ def add_columns_from(
 
 
 def merge_columns_from(
-    uri: str,
-    ds: Dataset,
+    uri: Optional[str] = None,
+    ds: Optional[Dataset] = None,
     *,
     read_version: Optional[int | str] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
@@ -875,7 +941,9 @@ def merge_columns_from(
         >>> lr.merge_columns_from("/tmp/data/", ray_ds)
 
     Args:
-        uri: The path to the destination Lance dataset.
+        uri: The path to the destination Lance dataset. If omitted, provide
+            ``namespace_impl`` and ``table_id`` to resolve the location from
+            the namespace.
         ds: A Ray Dataset containing ``_rowaddr`` and the new column(s) to add.
             Every fragment in the target Lance dataset must be represented
             (unless ``require_full_coverage=False``).
@@ -891,7 +959,18 @@ def merge_columns_from(
             target Lance dataset. Set to False to allow merging new columns
             into a subset of fragments only.
     """
-    storage_options = storage_options or {}
+    if ds is None:
+        raise ValueError("'ds' must be provided")
+
+    validate_uri_or_namespace(uri, namespace_impl, table_id)
+
+    uri, storage_options = resolve_namespace_table(
+        uri,
+        storage_options,
+        namespace_impl,
+        namespace_properties,
+        table_id,
+    )
     namespace_kwargs = get_namespace_kwargs(
         namespace_impl, namespace_properties, table_id
     )
@@ -905,7 +984,7 @@ def merge_columns_from(
 
     if "_fragid" not in ray_schema.names:
         ds = ds.map_batches(
-            _derive_fragid_from_rowaddr,
+            _derive_fragid_from_rowaddr,  # type: ignore[arg-type]
             batch_format="pyarrow",
         )
         ray_schema = ds.schema()
@@ -1019,7 +1098,7 @@ def merge_columns_from(
         map_groups_kwargs["ray_remote_args"] = ray_remote_args
 
     result_ds = ds.groupby("_fragid").map_groups(
-        _merge_one_fragment,
+        _merge_one_fragment,  # type: ignore[arg-type]
         batch_format="pyarrow",
         **map_groups_kwargs,
     )

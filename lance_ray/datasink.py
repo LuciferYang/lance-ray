@@ -12,7 +12,7 @@ import pyarrow as pa
 from lance_namespace import DescribeTableRequest
 from ray.data import DataContext
 from ray.data._internal.util import _check_import
-from ray.data.datasource.datasink import Datasink
+from ray.data.datasource.datasink import Datasink, WriteResult
 
 from .fragment import prepare_fragment_write_options, write_fragment
 from .utils import (
@@ -23,16 +23,25 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
+    from lance.fragment import FragmentMetadata
+    from lance_namespace import LanceNamespace
+
     import pandas as pd
+
+#: What a Lance write task hands back to the commit phase: one
+#: ``(pickled fragment, pickled schema)`` pair per written fragment.
+WriteReturn = list[tuple[bytes, bytes]]
 
 
 def _declare_table_with_fallback(
-    namespace, table_id: list[str]
-) -> tuple[str, Optional[dict[str, str]]]:
+    namespace: "LanceNamespace", table_id: list[str]
+) -> tuple[Optional[str], Optional[dict[str, str]]]:
     """Declare a table using declare_table, falling back to create_empty_table.
 
     Returns:
-        Tuple of (uri, storage_options)
+        Tuple of (uri, storage_options). The namespace protocol marks the
+        location as optional, so ``uri`` may be ``None``; the datasink raises
+        when it later needs a location it does not have.
     """
     try:
         from lance_namespace import DeclareTableRequest
@@ -49,7 +58,7 @@ def _declare_table_with_fallback(
         return create_response.location, create_response.storage_options
 
 
-class _BaseLanceDatasink(Datasink):
+class _BaseLanceDatasink(Datasink[WriteReturn]):
     """Base class for Lance Datasink."""
 
     def __init__(
@@ -59,6 +68,7 @@ class _BaseLanceDatasink(Datasink):
         *args: Any,
         schema: Optional[pa.Schema] = None,
         mode: Literal["create", "append", "overwrite"] = "create",
+        enable_stable_row_ids: bool = False,
         storage_options: Optional[dict[str, Any]] = None,
         base_store_params: Optional[dict[str, dict[str, Any]]] = None,
         initial_bases: Optional[list[Any]] = None,
@@ -83,6 +93,8 @@ class _BaseLanceDatasink(Datasink):
         # Construct namespace from impl and properties (cached per worker)
         namespace = get_or_create_namespace(namespace_impl, namespace_properties)
 
+        self.table_id: Optional[list[str]]
+        self.uri: Optional[str]
         if namespace is not None and table_id is not None:
             self.table_id = table_id
 
@@ -122,6 +134,7 @@ class _BaseLanceDatasink(Datasink):
 
         self.schema = schema
         self.mode = mode
+        self.enable_stable_row_ids = enable_stable_row_ids
         self.read_version: Optional[int] = None
         self.storage_options = merged_storage_options
         self.base_store_params = base_store_params
@@ -136,20 +149,31 @@ class _BaseLanceDatasink(Datasink):
         )
 
     @property
+    def dataset_uri(self) -> str:
+        """The resolved dataset URI, which every write/commit step requires."""
+        if self.uri is None:
+            raise ValueError(
+                "No dataset location is available. Provide 'uri', or "
+                "'namespace_impl' + 'table_id' pointing at a table whose "
+                "namespace reports a location."
+            )
+        return self.uri
+
+    @property
     def supports_distributed_writes(self) -> bool:
         return True
 
-    def on_write_start(self, schema: Optional[pa.Schema] = None):
+    def on_write_start(self, schema: Optional[pa.Schema] = None) -> None:
         _check_import(self, module="lance", package="pylance")
 
         import lance
 
         if self.mode == "append":
-            base_store_params_kwargs = {}
+            base_store_params_kwargs: dict[str, Any] = {}
             if self.base_store_params:
                 base_store_params_kwargs = {"base_store_params": self.base_store_params}
             ds = lance.LanceDataset(
-                self.uri,
+                self.dataset_uri,
                 storage_options=self.storage_options,
                 **self.namespace_kwargs,
                 **base_store_params_kwargs,
@@ -160,22 +184,27 @@ class _BaseLanceDatasink(Datasink):
 
     def on_write_complete(
         self,
-        write_result: list[list[tuple[str, str]]],
-    ):
+        write_result: WriteResult[WriteReturn] | list[WriteReturn],
+    ) -> None:
         import warnings
 
         import lance
 
-        write_results = write_result
-        if not write_results:
+        if not write_result:
             warnings.warn(
                 "write_results is empty.",
                 DeprecationWarning,
                 stacklevel=2,
             )
             return
-        if hasattr(write_results, "write_returns"):
-            write_results = write_results.write_returns  # type: ignore
+
+        # Older Ray releases pass the raw per-task return values, newer ones
+        # pass an aggregated ``WriteResult``; support both.
+        write_results: list[WriteReturn]
+        if hasattr(write_result, "write_returns"):
+            write_results = write_result.write_returns
+        else:
+            write_results = write_result
 
         if len(write_results) == 0:
             warnings.warn(
@@ -185,8 +214,8 @@ class _BaseLanceDatasink(Datasink):
             )
             return
 
-        fragments = []
-        schema = None
+        fragments: list[FragmentMetadata] = []
+        schema: Optional[pa.Schema] = None
         for batch in write_results:
             for fragment_str, schema_str in batch:
                 fragment = pickle.loads(fragment_str)
@@ -215,7 +244,7 @@ class _BaseLanceDatasink(Datasink):
         # Skip commit when there are no fragments.
         if not schema:
             return
-        op = None
+        op: Optional[lance.LanceOperation.BaseOperation] = None
         if self.mode in {"create", "overwrite"}:
             op = lance.LanceOperation.Overwrite(
                 schema,
@@ -229,14 +258,15 @@ class _BaseLanceDatasink(Datasink):
         elif self.mode == "append":
             op = lance.LanceOperation.Append(fragments)
         if op:
-            base_store_params_kwargs = {}
+            base_store_params_kwargs: dict[str, Any] = {}
             if self.base_store_params:
                 base_store_params_kwargs = {"base_store_params": self.base_store_params}
             lance.LanceDataset.commit(
-                self.uri,
+                self.dataset_uri,
                 op,
                 read_version=self.read_version,
                 storage_options=self.storage_options,
+                enable_stable_row_ids=self.enable_stable_row_ids,
                 **self.namespace_kwargs,
                 **base_store_params_kwargs,
             )
@@ -267,11 +297,16 @@ class LanceDatasink(_BaseLanceDatasink):
             The minimum number of rows per file. Default is 1024 * 1024.
         max_rows_per_file : int, optional
             The maximum number of rows per file. Default is 64 * 1024 * 1024.
+        max_bytes_per_file : int, optional
+            The maximum number of bytes per file. This is a soft limit. If not
+            provided, the PyLance default is used.
         data_storage_version: optional, str, default None
             The version of the data storage format to use. Newer versions are more
             efficient but require newer versions of lance to read.  The default is
             "legacy" which will use the legacy v1 version.  See the user guide
             for more details.
+        enable_stable_row_ids : bool, default False
+            Enable stable row IDs for the dataset and all written fragments.
         storage_options : Dict[str, Any], optional
             The storage options for the writer. Default is None.
         base_store_params : dict, optional
@@ -313,7 +348,9 @@ class LanceDatasink(_BaseLanceDatasink):
         mode: Literal["create", "append", "overwrite"] = "create",
         min_rows_per_file: int = 1024 * 1024,
         max_rows_per_file: int = 64 * 1024 * 1024,
+        max_bytes_per_file: Optional[int] = None,
         data_storage_version: Optional[str] = None,
+        enable_stable_row_ids: bool = False,
         storage_options: Optional[dict[str, Any]] = None,
         base_store_params: Optional[dict[str, dict[str, Any]]] = None,
         initial_bases: Optional[list[Any]] = None,
@@ -338,6 +375,7 @@ class LanceDatasink(_BaseLanceDatasink):
             *args,
             schema=schema,
             mode=mode,
+            enable_stable_row_ids=enable_stable_row_ids,
             storage_options=storage_options,
             base_store_params=base_store_params,
             initial_bases=initial_bases,
@@ -357,6 +395,7 @@ class LanceDatasink(_BaseLanceDatasink):
             )
         self.min_rows_per_file = min_rows_per_file
         self.max_rows_per_file = max_rows_per_file
+        self.max_bytes_per_file = max_bytes_per_file
         self.data_storage_version = data_storage_version
         self.external_blob_mode = external_blob_mode
         self.allow_external_blob_outside_bases = allow_external_blob_outside_bases
@@ -384,14 +423,16 @@ class LanceDatasink(_BaseLanceDatasink):
         self,
         blocks: Iterable[Union[pa.Table, "pd.DataFrame"]],
         ctx: Any,
-    ):
+    ) -> WriteReturn:
         fragments_and_schema = write_fragment(
             blocks,
-            self.uri,
+            self.dataset_uri,
             schema=self.schema,
             mode=self.mode,
             max_rows_per_file=self.max_rows_per_file,
+            max_bytes_per_file=self.max_bytes_per_file,
             data_storage_version=self.data_storage_version,
+            enable_stable_row_ids=self.enable_stable_row_ids,
             storage_options=self.storage_options,
             base_store_params=self.base_store_params,
             initial_bases=self.initial_bases if self.mode == "create" else None,
@@ -427,9 +468,9 @@ class LanceFragmentCommitter(_BaseLanceDatasink):
         self,
         blocks: Iterable[Union[pa.Table, "pd.DataFrame"]],
         _ctx: Any,
-    ):
+    ) -> WriteReturn:
         """Passthrough the fragments to commit phase"""
-        v = []
+        v: WriteReturn = []
         for block in blocks:
             # If block is empty, skip to get "fragment" and "schema" filed
             if len(block) == 0:

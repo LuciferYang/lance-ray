@@ -1,5 +1,6 @@
 import logging
-from typing import Any, Optional
+from collections.abc import Callable
+from typing import Any, Optional, cast
 
 import lance
 from lance.lance import CompactionMetrics
@@ -9,6 +10,7 @@ from ray.util.multiprocessing import Pool
 from .utils import (
     get_namespace_kwargs,
     get_or_create_namespace,
+    resolve_namespace_table,
     validate_uri_or_namespace,
 )
 
@@ -21,7 +23,7 @@ def _handle_compaction_task(
     namespace_impl: Optional[str] = None,
     namespace_properties: Optional[dict[str, str]] = None,
     table_id: Optional[list[str]] = None,
-):
+) -> Callable[[CompactionTask], dict[str, Any]]:
     """
     Create a function to handle compaction task execution for use with Pool.
     This function returns a callable that can be used with Pool.map_async
@@ -118,19 +120,10 @@ def compact_files(
     """
     validate_uri_or_namespace(uri, namespace_impl, table_id)
 
-    merged_storage_options: dict[str, Any] = {}
-    if storage_options:
-        merged_storage_options.update(storage_options)
-
     # Resolve URI and get storage options from namespace if provided
-    namespace = get_or_create_namespace(namespace_impl, namespace_properties)
-    if namespace is not None and table_id is not None:
-        from lance_namespace import DescribeTableRequest
-
-        describe_response = namespace.describe_table(DescribeTableRequest(id=table_id))
-        uri = describe_response.location
-        if describe_response.storage_options:
-            merged_storage_options.update(describe_response.storage_options)
+    uri, merged_storage_options = resolve_namespace_table(
+        uri, storage_options, namespace_impl, namespace_properties, table_id
+    )
 
     namespace_kwargs = get_namespace_kwargs(
         namespace_impl, namespace_properties, table_id
@@ -146,7 +139,13 @@ def compact_files(
     logger.info("Starting distributed compaction")
 
     # Step 1: Create the compaction plan
-    compaction_plan = Compaction.plan(dataset, compaction_options)
+    # Compaction.plan requires a dict; CompactionOptions is a TypedDict, so
+    # an empty instance stands in for "all defaults" when the caller omits it.
+    # It is declared with ``total=True`` upstream even though every key is
+    # optional at runtime, hence the cast instead of ``CompactionOptions()``.
+    compaction_plan = Compaction.plan(
+        dataset, compaction_options or cast(CompactionOptions, {})
+    )
 
     logger.info(f"Compaction plan created with {compaction_plan.num_tasks()} tasks")
 
