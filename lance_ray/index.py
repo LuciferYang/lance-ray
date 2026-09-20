@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+from __future__ import annotations
+
 import logging
 import math
 import uuid
 from collections.abc import Callable
-from typing import Any, Literal, Optional, TypeAlias, Union
+from typing import Any, Literal, Optional, TypeAlias, cast, get_args
 
 import lance
 import pyarrow as pa
@@ -26,13 +28,18 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+# Spelled as strings because pyarrow's classes are not subscriptable at
+# runtime, only in the stubs.
 _VectorIndexArtifact: TypeAlias = (
-    pa.Array | pa.FixedSizeListArray | pa.FixedShapeTensorArray | None
+    "pa.Array[Any] | pa.FixedSizeListArray[Any] | pa.FixedShapeTensorArray[Any] | None"
 )
-_VectorIndexArtifactRef: TypeAlias = _VectorIndexArtifact | ray.ObjectRef
-_VectorIndexArtifactRefs: TypeAlias = tuple[
-    _VectorIndexArtifactRef, _VectorIndexArtifactRef
-]
+_VectorIndexArtifactRef: TypeAlias = "_VectorIndexArtifact | ray.ObjectRef[Any]"
+_VectorIndexArtifactRefs: TypeAlias = (
+    "tuple[_VectorIndexArtifactRef, _VectorIndexArtifactRef]"
+)
+
+#: The closure a fragment handler factory hands to the worker pool.
+_FragmentHandler: TypeAlias = Callable[[list[int]], dict[str, Any]]
 
 
 def _dataset_load_kwargs(
@@ -49,31 +56,35 @@ def _dataset_load_kwargs(
     return kwargs
 
 
+def _index_exists(dataset: LanceDataset, name: str) -> bool:
+    return any(index.name == name for index in dataset.describe_indices())
+
+
 def _distribute_fragments_balanced(
-    fragments: list[Any], num_workers: int, logger: logging.Logger
+    fragments: list[Any], num_segments: int, logger: logging.Logger
 ) -> list[list[int]]:
-    """Distribute fragments across workers using a balanced algorithm.
+    """Distribute fragments across index segments using a balanced algorithm.
 
     This function implements a greedy algorithm that assigns fragments to the
-    worker with the currently smallest total workload, helping to balance the
-    processing time across workers.
+    segment with the currently smallest total workload, helping to balance the
+    processing time across segment batches.
 
     Parameters
     ----------
     fragments : list
         List of Lance fragment objects.
-    num_workers : int
-        Number of workers to distribute fragments across.
+    num_segments : int
+        Number of segment batches to distribute fragments across.
     logger : logging.Logger
         Logger instance for debugging information.
 
     Returns
     -------
     list[list[int]]
-        Each inner list contains fragment IDs for one worker.
+        Each inner list contains fragment IDs for one segment batch.
     """
     if not fragments:
-        return [[] for _ in range(num_workers)]
+        return [[] for _ in range(num_segments)]
 
     fragment_info: list[dict[str, int]] = []
     for fragment in fragments:
@@ -96,40 +107,39 @@ def _distribute_fragments_balanced(
     # This helps with better load balancing using the greedy algorithm
     fragment_info.sort(key=lambda x: x["size"], reverse=True)
 
-    worker_batches: list[list[int]] = [[] for _ in range(num_workers)]
-    worker_workloads = [0] * num_workers
+    segment_batches: list[list[int]] = [[] for _ in range(num_segments)]
+    segment_workloads = [0] * num_segments
 
-    # Greedy assignment: assign each fragment to the worker with minimum workload
+    # Greedy assignment: assign each fragment to the segment with minimum workload
     for frag_info in fragment_info:
-        # Find the worker with the minimum current workload
-        min_workload_idx = min(range(num_workers), key=lambda i: worker_workloads[i])
-        worker_batches[min_workload_idx].append(frag_info["id"])
-        worker_workloads[min_workload_idx] += frag_info["size"]
+        min_workload_idx = min(range(num_segments), key=lambda i: segment_workloads[i])
+        segment_batches[min_workload_idx].append(frag_info["id"])
+        segment_workloads[min_workload_idx] += frag_info["size"]
 
     total_size = sum(info["size"] for info in fragment_info)
     logger.info("Fragment distribution statistics:")
     logger.info("  Total fragments: %d", len(fragment_info))
     logger.info("  Total size: %d", total_size)
-    logger.info("  Workers: %d", num_workers)
+    logger.info("  Segments: %d", num_segments)
 
     for i, (batch, workload) in enumerate(
-        zip(worker_batches, worker_workloads, strict=False)
+        zip(segment_batches, segment_workloads, strict=False)
     ):
         percentage = (workload / total_size * 100) if total_size > 0 else 0
         logger.info(
-            "  Worker %d: %d fragments, workload: %d (%.1f%%)",
+            "  Segment %d: %d fragments, workload: %d (%.1f%%)",
             i,
             len(batch),
             workload,
             percentage,
         )
 
-    non_empty_batches = [batch for batch in worker_batches if batch]
+    non_empty_batches = [batch for batch in segment_batches if batch]
     return non_empty_batches
 
 
 def _map_async_with_pool(
-    create_fragment_handler: Callable[[], Any],
+    create_fragment_handler: Callable[[], _FragmentHandler],
     fragment_batches: list[list[int]],
     *,
     num_workers: int,
@@ -148,7 +158,7 @@ def _map_async_with_pool(
             processes=num_workers, ray_remote_args=ray_remote_args
         ) as pool:
             fragment_handler = create_fragment_handler()
-            results = pool.map_async(
+            results: list[dict[str, Any]] = pool.map_async(
                 fragment_handler,
                 fragment_batches,
                 chunksize=1,
@@ -159,6 +169,16 @@ def _map_async_with_pool(
     return results
 
 
+def _resolve_num_segments(num_workers: int, num_segments: Optional[int]) -> int:
+    if num_workers <= 0:
+        raise ValueError(f"num_workers must be positive, got {num_workers}")
+    if num_segments is None:
+        return num_workers
+    if num_segments <= 0:
+        raise ValueError(f"num_segments must be positive, got {num_segments}")
+    return num_segments
+
+
 def _is_ray_object_ref(value: Any) -> bool:
     object_ref_type = getattr(ray, "ObjectRef", None)
     return object_ref_type is not None and isinstance(value, object_ref_type)
@@ -166,19 +186,19 @@ def _is_ray_object_ref(value: Any) -> bool:
 
 def _ray_put_index_artifact(value: Any) -> _VectorIndexArtifactRef:
     if value is None or _is_ray_object_ref(value):
-        return value
+        return cast("_VectorIndexArtifactRef", value)
     return ray.put(value)
 
 
 def _ray_get_index_artifact(value: Any) -> _VectorIndexArtifact:
     if _is_ray_object_ref(value):
-        return ray.get(value)
-    return value
+        return cast("_VectorIndexArtifact", ray.get(value))
+    return cast("_VectorIndexArtifact", value)
 
 
 def _put_vector_index_artifacts_in_object_store(
-    ivf_centroids: pa.Array | pa.FixedSizeListArray | pa.FixedShapeTensorArray | None,
-    pq_codebook: pa.Array | pa.FixedSizeListArray | pa.FixedShapeTensorArray | None,
+    ivf_centroids: _VectorIndexArtifact,
+    pq_codebook: _VectorIndexArtifact,
 ) -> _VectorIndexArtifactRefs:
     return (
         _ray_put_index_artifact(ivf_centroids),
@@ -186,7 +206,32 @@ def _put_vector_index_artifacts_in_object_store(
     )
 
 
-_SCALAR_SEGMENT_INDEX_TYPES = {"BTREE", "BITMAP", "INVERTED", "FTS"}
+def _build_rabitq_model(*, dimension: int, num_bits: int = 1) -> str:
+    """Build one shared RaBitQ rotation model for distributed IVF_RQ shards.
+
+    ``dimension`` is the vector width and must satisfy Lance's IVF_RQ
+    requirement that it is divisible by 8. ``num_bits`` controls the number of
+    RaBitQ code bits per vector dimension and defaults to Lance's IVF_RQ default
+    of 1; supported values are validated by ``lance.lance.indices.build_rq_model``.
+    """
+    from lance.lance import indices
+
+    return indices.build_rq_model(dimension=dimension, num_bits=num_bits)
+
+
+_ScalarIndexType: TypeAlias = Literal[
+    "BTREE",
+    "BITMAP",
+    "LABEL_LIST",
+    "INVERTED",
+    "FTS",
+    "NGRAM",
+    "ZONEMAP",
+    "BLOOMFILTER",
+    "RTREE",
+]
+_SCALAR_INDEX_TYPES = get_args(_ScalarIndexType)
+_SCALAR_SEGMENT_INDEX_TYPES = frozenset(_SCALAR_INDEX_TYPES)
 
 
 def _scalar_index_type_name(index_type: str | IndexConfig) -> str | None:
@@ -200,8 +245,9 @@ def _scalar_index_type_name(index_type: str | IndexConfig) -> str | None:
 def _handle_scalar_segment_index(
     dataset_uri: str,
     column: str,
-    index_type: str | IndexConfig,
+    index_type: _ScalarIndexType | IndexConfig,
     name: str,
+    replace: bool,
     train: bool,
     storage_options: Optional[dict[str, str]] = None,
     block_size: Optional[int] = None,
@@ -209,7 +255,7 @@ def _handle_scalar_segment_index(
     namespace_properties: Optional[dict[str, str]] = None,
     table_id: Optional[list[str]] = None,
     **kwargs: Any,
-):
+) -> _FragmentHandler:
     """Create a fragment handler closure for scalar segment index builds."""
 
     def func(fragment_ids: list[int]) -> dict[str, Any]:
@@ -242,9 +288,11 @@ def _handle_scalar_segment_index(
 
             segment_index = dataset.create_index_uncommitted(
                 column=column,
-                index_type=index_type,
+                # pylance annotates this as ``str`` but accepts an
+                # ``IndexConfig`` too (see ``_prepare_scalar_index_request``).
+                index_type=index_type,  # type: ignore[arg-type]
                 name=name,
-                replace=False,
+                replace=replace,
                 train=train,
                 storage_options=storage_options,
                 fragment_ids=fragment_ids,
@@ -280,7 +328,7 @@ def _handle_scalar_segment_index(
 def _handle_fragment_index(
     dataset_uri: str,
     column: str,
-    index_type: str | IndexConfig,
+    index_type: _ScalarIndexType | IndexConfig,
     name: str,
     index_uuid: str,
     replace: bool,
@@ -291,7 +339,7 @@ def _handle_fragment_index(
     namespace_properties: Optional[dict[str, str]] = None,
     table_id: Optional[list[str]] = None,
     **kwargs: Any,
-):
+) -> _FragmentHandler:
     """Create a fragment handler closure for scalar index builds.
 
     The returned callable can be used with :func:`Pool.map_async` to build
@@ -367,28 +415,26 @@ def _handle_fragment_index(
     return func
 
 
-def merge_index_metadata_compat(dataset, index_id, index_type, **kwargs):
+def merge_index_metadata_compat(
+    dataset: LanceDataset,
+    index_id: str,
+    index_type: str,
+    **kwargs: Any,
+) -> Any:
     """Call ``merge_index_metadata`` with backwards compatible signature."""
     try:
         return dataset.merge_index_metadata(
             index_id, index_type, batch_readhead=kwargs.get("batch_readhead")
         )
     except TypeError:
-        return dataset.merge_index_metadata(index_id)
+        return dataset.merge_index_metadata(index_id)  # type: ignore[call-arg]
 
 
 def create_scalar_index(
-    uri: Optional[str] = None,
+    uri: Optional[str | lance.LanceDataset] = None,
     *,
     column: str,
-    index_type: Literal["BTREE"]
-    | Literal["BITMAP"]
-    | Literal["LABEL_LIST"]
-    | Literal["INVERTED"]
-    | Literal["FTS"]
-    | Literal["NGRAM"]
-    | Literal["ZONEMAP"]
-    | IndexConfig,
+    index_type: _ScalarIndexType | IndexConfig,
     table_id: Optional[list[str]] = None,
     name: Optional[str] = None,
     replace: bool = True,
@@ -396,21 +442,25 @@ def create_scalar_index(
     fragment_ids: Optional[list[int]] = None,
     index_uuid: Optional[str] = None,
     num_workers: int = 4,
+    num_segments: Optional[int] = None,
     storage_options: Optional[dict[str, str]] = None,
     block_size: Optional[int] = None,
     namespace_impl: Optional[str] = None,
     namespace_properties: Optional[dict[str, str]] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
     **kwargs: Any,
-) -> "lance.LanceDataset":
+) -> lance.LanceDataset:
     """Build scalar indices with Ray in a distributed workflow.
 
     Args:
-        uri: The URI of the Lance dataset to build index on. Either uri OR
-            (namespace_impl + table_id) must be provided.
+        uri: Lance dataset or URI to build index on. Either uri OR
+            (namespace_impl + table_id) must be provided. When passed a
+            ``LanceDataset``, its dataset URI is retained so distributed
+            workers and the final commit stay on the same Lance branch.
         column: Column name to index.
         index_type: Type of index to build ("BTREE", "BITMAP", "LABEL_LIST",
-            "INVERTED", "FTS", "NGRAM", "ZONEMAP") or IndexConfig object.
+            "INVERTED", "FTS", "NGRAM", "ZONEMAP", "BLOOMFILTER", "RTREE")
+            or IndexConfig object.
         table_id: The table identifier as a list of strings. Must be provided
             together with namespace_impl.
         name: Name of the index (generated if None).
@@ -418,7 +468,9 @@ def create_scalar_index(
         train: Whether to train the index (default: True).
         fragment_ids: Optional list of fragment IDs to build index on.
         index_uuid: Optional fragment UUID for distributed indexing.
-        num_workers: Number of Ray workers to use (keyword-only).
+        num_workers: Maximum number of Ray Pool workers to use (keyword-only).
+        num_segments: Number of fragment batches / index segments to create
+            (keyword-only). Defaults to num_workers for backwards compatibility.
         storage_options: Storage options for the dataset (keyword-only).
         block_size: Block size in bytes to use when loading the dataset (keyword-only).
         namespace_impl: The namespace implementation type (e.g., "rest", "dir").
@@ -434,7 +486,7 @@ def create_scalar_index(
 
     Raises:
         ValueError: If input parameters are invalid.
-        TypeError: If column type is not string.
+        TypeError: If the column type is incompatible with the index type.
         RuntimeError: If index building fails or pylance version is incompatible.
     """
     # Check pylance version compatibility
@@ -462,38 +514,30 @@ def create_scalar_index(
     index_id = str(uuid.uuid4())
     logger.info("Starting distributed scalar index build with ID: %s", index_id)
 
-    # Validate uri or namespace params
-    validate_uri_or_namespace(uri, namespace_impl, table_id)
+    # Match the vector index entrypoint: URI / namespace mode is selected by
+    # the input value; every other value is treated as a dataset object.
+    if isinstance(uri, str | type(None)):
+        validate_uri_or_namespace(uri, namespace_impl, table_id)
 
     if not column:
         raise ValueError("Column name cannot be empty")
 
-    if num_workers <= 0:
-        raise ValueError(f"num_workers must be positive, got {num_workers}")
+    requested_num_segments = _resolve_num_segments(num_workers, num_segments)
 
     if block_size is not None and block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}")
 
     if isinstance(index_type, str):
-        valid_index_types = [
-            "BTREE",
-            "BITMAP",
-            "LABEL_LIST",
-            "INVERTED",
-            "FTS",
-            "NGRAM",
-            "ZONEMAP",
-        ]
-        if index_type not in valid_index_types:
+        if index_type not in _SCALAR_INDEX_TYPES:
             raise ValueError(
-                f"Index type must be one of {valid_index_types}, not '{index_type}'"
+                "Index type must be one of "
+                f"{list(_SCALAR_INDEX_TYPES)}, not '{index_type}'"
             )
 
-        supported_distributed_types = {"INVERTED", "FTS", "BTREE", "BITMAP"}
-        if index_type not in supported_distributed_types:
+        if index_type not in _SCALAR_SEGMENT_INDEX_TYPES:
             raise ValueError(
                 "Distributed indexing currently supports "
-                f"{sorted(supported_distributed_types)} index types, "
+                f"{sorted(_SCALAR_SEGMENT_INDEX_TYPES)} index types, "
                 f"not '{index_type}'"
             )
     elif not isinstance(index_type, IndexConfig):
@@ -505,20 +549,27 @@ def create_scalar_index(
     # Note: Ray initialization is now handled by the Pool, following the pattern from io.py
     # This removes the need for explicit ray.init() calls
 
-    # Resolve URI and get storage options from namespace if provided
-    uri, merged_storage_options = resolve_namespace_table(
-        uri, storage_options, namespace_impl, namespace_properties, table_id
-    )
-
-    namespace_kwargs = get_namespace_kwargs(
-        namespace_impl, namespace_properties, table_id
-    )
-
-    # Load dataset
-    dataset = LanceDataset(
-        uri,
-        **_dataset_load_kwargs(merged_storage_options, namespace_kwargs, block_size),
-    )
+    if isinstance(uri, str | type(None)):
+        # Resolve URI and get storage options from namespace if provided.
+        dataset_uri, merged_storage_options = resolve_namespace_table(
+            uri, storage_options, namespace_impl, namespace_properties, table_id
+        )
+        namespace_kwargs = get_namespace_kwargs(
+            namespace_impl, namespace_properties, table_id
+        )
+        dataset = LanceDataset(
+            dataset_uri,
+            **_dataset_load_kwargs(
+                merged_storage_options, namespace_kwargs, block_size
+            ),
+        )
+    else:
+        dataset = uri
+        dataset_uri = dataset.uri
+        merged_storage_options = (
+            storage_options or getattr(dataset, "_storage_options", None) or {}
+        )
+        namespace_kwargs = {}
 
     try:
         resolved_column = resolve_dataset_field_path(dataset, column)
@@ -537,22 +588,34 @@ def create_scalar_index(
 
     if isinstance(index_type, str):
         match index_type:
-            case "INVERTED" | "FTS":
-                if not pa.types.is_string(value_type):
+            case "INVERTED" | "FTS" | "NGRAM":
+                if not (
+                    pa.types.is_string(value_type)
+                    or pa.types.is_large_string(value_type)
+                ):
                     raise TypeError(
                         f"Column {column} must be string type for {index_type} "
                         f"index, got {value_type}"
                     )
-            case "BTREE":
+            case "BTREE" | "ZONEMAP":
                 is_supported = (
                     pa.types.is_integer(value_type)
                     or pa.types.is_floating(value_type)
                     or pa.types.is_string(value_type)
+                    or pa.types.is_large_string(value_type)
                 )
                 if not is_supported:
                     raise TypeError(
-                        f"Column {column} must be numeric or string type for BTREE "
-                        f"index, got {value_type}"
+                        f"Column {column} must be numeric or string type for "
+                        f"{index_type} index, got {value_type}"
+                    )
+            case "LABEL_LIST":
+                if not (
+                    pa.types.is_list(field.type) or pa.types.is_large_list(field.type)
+                ):
+                    raise TypeError(
+                        f"Column {column} must be list or large list type for "
+                        f"LABEL_LIST index, got {field.type}"
                     )
             case _:
                 # For other index types, skip strict validation to maintain compatibility
@@ -565,37 +628,21 @@ def create_scalar_index(
     if name is None:
         name = f"{column}_idx"
 
-    if replace:
-        try:
-            existing_indices = dataset.list_indices()
-        except Exception:  # pragma: no cover
-            existing_indices = []
-
-        if any(idx.get("name") == name for idx in existing_indices):
-            # Lance 4.0.0: fragment_ids + replace=True may hit an unimplemented path.
-            # Implement replace semantics at the driver by dropping the index first.
-            dataset.drop_index(name)
-            dataset = LanceDataset(
-                uri,
-                **_dataset_load_kwargs(
-                    merged_storage_options, namespace_kwargs, block_size
-                ),
-            )
-
-    else:
-        index_exists = False
-        try:
-            existing_indices = dataset.list_indices()
-            existing_names = {idx["name"] for idx in existing_indices}
-            index_exists = name in existing_names
-        except (
-            Exception
-        ):  # pragma: no cover - list_indices() not available in older lance versions
-            pass
-        if index_exists:
+    if _index_exists(dataset, name):
+        if not replace:
             raise ValueError(
                 f"Index with name '{name}' already exists. Set replace=True "
                 "to replace it."
+            )
+        if not use_segment_workflow:
+            # Lance 4.0.0: fragment_ids + replace=True may hit an unimplemented path.
+            # Keep the existing driver-side replacement behavior for the legacy workflow.
+            dataset.drop_index(name)
+            dataset = LanceDataset(
+                dataset_uri,
+                **_dataset_load_kwargs(
+                    merged_storage_options, namespace_kwargs, block_size
+                ),
             )
 
     fragments = dataset.get_fragments()
@@ -614,19 +661,34 @@ def create_scalar_index(
     else:
         fragment_ids_to_use = [fragment.fragment_id for fragment in fragments]
 
-    if num_workers > len(fragment_ids_to_use):
-        num_workers = len(fragment_ids_to_use)
-        logger.info("Adjusted num_workers to %d to match fragment count", num_workers)
+    if requested_num_segments > len(fragment_ids_to_use):
+        requested_num_segments = len(fragment_ids_to_use)
+        logger.info(
+            "Adjusted num_segments to %d to match fragment count",
+            requested_num_segments,
+        )
 
-    fragment_batches = _distribute_fragments_balanced(fragments, num_workers, logger)
+    fragment_batches = _distribute_fragments_balanced(
+        fragments, num_segments=requested_num_segments, logger=logger
+    )
+    pool_workers = min(num_workers, len(fragment_batches))
+    if pool_workers < num_workers:
+        logger.info(
+            "Limiting Ray Pool workers to %d (requested %d) because there are "
+            "only %d non-empty segment batches",
+            pool_workers,
+            num_workers,
+            len(fragment_batches),
+        )
 
     def create_fragment_handler() -> Any:
         if use_segment_workflow:
             return _handle_scalar_segment_index(
-                dataset_uri=uri,
+                dataset_uri=dataset_uri,
                 column=column,
                 index_type=index_type,
                 name=name,
+                replace=replace,
                 train=train,
                 storage_options=merged_storage_options,
                 block_size=block_size,
@@ -637,7 +699,7 @@ def create_scalar_index(
             )
 
         return _handle_fragment_index(
-            dataset_uri=uri,
+            dataset_uri=dataset_uri,
             column=column,
             index_type=index_type,
             name=name,
@@ -653,15 +715,17 @@ def create_scalar_index(
         )
 
     logger.info(
-        "Phase 1: Distributing scalar index build across %d workers for %d fragments",
+        "Phase 1: Distributing scalar index build across %d segment batches "
+        "using up to %d workers for %d fragments",
         len(fragment_batches),
+        pool_workers,
         len(fragment_ids_to_use),
     )
 
     results = _map_async_with_pool(
         create_fragment_handler=create_fragment_handler,
         fragment_batches=fragment_batches,
-        num_workers=num_workers,
+        num_workers=pool_workers,
         ray_remote_args=ray_remote_args,
         error_prefix="Failed to complete distributed index building",
     )
@@ -673,7 +737,7 @@ def create_scalar_index(
 
     # Reload dataset to get the latest state after fragment index creation
     dataset = LanceDataset(
-        uri,
+        dataset_uri,
         **_dataset_load_kwargs(merged_storage_options, namespace_kwargs, block_size),
     )
 
@@ -698,9 +762,10 @@ def create_scalar_index(
             name,
         )
         logger.info(
-            "Fragments: %d, Workers: %d",
+            "Fragments: %d, Segments: %d, Workers: %d",
             len(fragment_ids_to_use),
             len(fragment_batches),
+            pool_workers,
         )
         return updated_dataset
 
@@ -729,7 +794,7 @@ def create_scalar_index(
     )
 
     updated_dataset = lance.LanceDataset.commit(
-        uri,
+        dataset_uri,
         create_index_op,
         read_version=dataset.version,
         storage_options=merged_storage_options,
@@ -741,10 +806,11 @@ def create_scalar_index(
         name,
     )
     logger.info(
-        "Index ID: %s, Fragments: %d, Workers: %d",
+        "Index ID: %s, Fragments: %d, Segments: %d, Workers: %d",
         index_id,
         len(fragment_ids_to_use),
         len(fragment_batches),
+        pool_workers,
     )
     return updated_dataset
 
@@ -757,6 +823,7 @@ def create_scalar_index(
 _VECTOR_INDEX_TYPES = {
     "IVF_FLAT",
     "IVF_PQ",
+    "IVF_RQ",
     "IVF_SQ",
     "IVF_HNSW_FLAT",
     "IVF_HNSW_PQ",
@@ -764,9 +831,9 @@ _VECTOR_INDEX_TYPES = {
 }
 
 
-def _vector_dimension(field: pa.Field) -> int:
+def _vector_dimension(field: pa.Field[Any]) -> int:
     if pa.types.is_fixed_size_list(field.type):
-        return field.type.list_size
+        return int(field.type.list_size)
     if isinstance(field.type, pa.FixedShapeTensorType) and len(field.type.shape) == 1:
         return field.type.shape[0]
     raise TypeError(
@@ -775,7 +842,7 @@ def _vector_dimension(field: pa.Field) -> int:
     )
 
 
-def _validate_vector_value_type(field: pa.Field) -> None:
+def _validate_vector_value_type(field: pa.Field[Any]) -> None:
     value_type = field.type.value_type
     if not (
         pa.types.is_floating(value_type) or pa.types.is_unsigned_integer(value_type)
@@ -794,7 +861,7 @@ def _schema_names(schema: pa.Schema) -> list[str]:
 
 
 class _NestedVectorIndicesBuilder:
-    def __init__(self, dataset: LanceDataset, column: str, field: pa.Field):
+    def __init__(self, dataset: LanceDataset, column: str, field: pa.Field[Any]):
         self.dataset = dataset
         self.column = column
         self.dimension = _vector_dimension(field)
@@ -843,6 +910,7 @@ class _NestedVectorIndicesBuilder:
         *,
         sample_rate: int = 256,
         max_iters: int = 50,
+        num_bits: int = 8,
         fragment_ids: Optional[list[int]] = None,
     ) -> Any:
         from lance.indices.pq import PqModel
@@ -850,7 +918,7 @@ class _NestedVectorIndicesBuilder:
 
         num_rows = _count_rows_for_fragments(self.dataset, fragment_ids)
         num_subvectors = _normalize_pq_params(num_subvectors, self.dimension)
-        _verify_pq_sample_rate(num_rows, sample_rate)
+        _verify_pq_sample_rate(num_rows, sample_rate, num_bits)
         codebook = indices.train_pq_model(
             self.dataset._ds,
             self.column,
@@ -861,8 +929,15 @@ class _NestedVectorIndicesBuilder:
             max_iters,
             ivf_model.centroids,
             fragment_ids,
+            num_bits=num_bits,
         )
-        return PqModel(num_subvectors, codebook)
+        # ``train_pq_model`` is annotated as returning a generic ``pa.Array``
+        # upstream, but always produces a fixed-size-list codebook.
+        return PqModel(
+            num_subvectors,
+            cast("pa.FixedSizeListArray[Any]", codebook),
+            num_bits=num_bits,
+        )
 
 
 def _count_rows_for_fragments(
@@ -951,20 +1026,21 @@ def _normalize_pq_params(num_subvectors: Optional[int], dimension: int) -> int:
     return num_subvectors
 
 
-def _verify_pq_sample_rate(num_rows: int, sample_rate: int) -> None:
+def _verify_pq_sample_rate(num_rows: int, sample_rate: int, num_bits: int = 8) -> None:
     _verify_base_sample_rate(sample_rate)
-    if 256 * sample_rate > num_rows:
+    required_rows = (2**num_bits) * sample_rate
+    if required_rows > num_rows:
         raise ValueError(
             "There are not enough rows in the dataset to create PQ codebook with "
-            f"a sample rate of {sample_rate}. {sample_rate * 256} rows needed and "
-            f"there are {num_rows}"
+            f"a sample rate of {sample_rate} and num_bits of {num_bits}. "
+            f"{required_rows} rows needed and there are {num_rows}"
         )
 
 
 def _indices_builder_for_field_path(
     dataset: LanceDataset,
     column: str,
-    field: pa.Field,
+    field: pa.Field[Any],
 ) -> IndicesBuilder | _NestedVectorIndicesBuilder:
     if column in _schema_names(dataset.schema):
         return IndicesBuilder(dataset, column)
@@ -978,12 +1054,17 @@ def _train_pq_for_field_path(
     *,
     num_subvectors: Optional[int],
     sample_rate: int,
+    num_bits: int,
+    max_iters: Optional[int],
 ) -> Any:
-    return builder.train_pq(
-        ivf_model,
-        num_subvectors=num_subvectors,
-        sample_rate=sample_rate,
-    )
+    train_kwargs: dict[str, Any] = {
+        "num_subvectors": num_subvectors,
+        "sample_rate": sample_rate,
+        "num_bits": num_bits,
+    }
+    if max_iters is not None:
+        train_kwargs["max_iters"] = max_iters
+    return builder.train_pq(ivf_model, **train_kwargs)
 
 
 def _normalize_index_type(index_type: Any) -> str:
@@ -1065,15 +1146,16 @@ def _handle_vector_fragment_index(
     metric: str,
     num_partitions: Optional[int],
     num_sub_vectors: Optional[int],
-    ivf_centroids: pa.Array | pa.FixedSizeListArray | pa.FixedShapeTensorArray | None,
-    pq_codebook: pa.Array | pa.FixedSizeListArray | pa.FixedShapeTensorArray | None,
+    ivf_centroids: _VectorIndexArtifactRef,
+    pq_codebook: _VectorIndexArtifactRef,
+    sample_rate: int = 256,
     storage_options: Optional[dict[str, str]] = None,
     block_size: Optional[int] = None,
     namespace_impl: Optional[str] = None,
     namespace_properties: Optional[dict[str, str]] = None,
     table_id: Optional[list[str]] = None,
     **kwargs: Any,
-):
+) -> _FragmentHandler:
     """Create a fragment handler closure for vector index builds."""
 
     def func(fragment_ids: list[int]) -> dict[str, Any]:
@@ -1113,9 +1195,13 @@ def _handle_vector_fragment_index(
                 metric=metric,
                 replace=replace,
                 num_partitions=num_partitions,
-                ivf_centroids=resolved_ivf_centroids,
-                pq_codebook=resolved_pq_codebook,
+                # pylance accepts a numpy array or a fixed-size-list/tensor
+                # array here; lance-ray also allows the ``pa.Array`` base type,
+                # which centroid/codebook arrays always satisfy at runtime.
+                ivf_centroids=resolved_ivf_centroids,  # type: ignore[arg-type]
+                pq_codebook=resolved_pq_codebook,  # type: ignore[arg-type]
                 num_sub_vectors=num_sub_vectors,
+                sample_rate=sample_rate,
                 storage_options=storage_options,
                 train=True,
                 fragment_ids=fragment_ids,
@@ -1150,13 +1236,14 @@ def _handle_vector_fragment_index(
 
 
 def create_index(
-    uri: Optional[Union[str, "lance.LanceDataset"]] = None,
+    uri: Optional[str | lance.LanceDataset] = None,
     column: str = "",
     index_type: str | Any = "",
     name: Optional[str] = None,
     *,
     replace: bool = True,
     num_workers: int = 4,
+    num_segments: Optional[int] = None,
     storage_options: Optional[dict[str, str]] = None,
     block_size: Optional[int] = None,
     namespace_impl: Optional[str] = None,
@@ -1167,14 +1254,11 @@ def create_index(
     num_partitions: Optional[int] = None,
     num_sub_vectors: Optional[int] = None,
     sample_rate: int = 256,
-    ivf_centroids: Optional[
-        pa.Array | pa.FixedSizeListArray | pa.FixedShapeTensorArray
-    ] = None,
-    pq_codebook: Optional[
-        pa.Array | pa.FixedSizeListArray | pa.FixedShapeTensorArray
-    ] = None,
+    ivf_centroids: _VectorIndexArtifact = None,
+    pq_codebook: _VectorIndexArtifact = None,
+    rabitq_model: Optional[str] = None,
     **kwargs: Any,
-) -> "lance.LanceDataset":
+) -> lance.LanceDataset:
     """Build distributed vector indices with Ray.
 
     This function mirrors :func:`create_scalar_index` but targets the precise
@@ -1183,20 +1267,29 @@ def create_index(
     Args:
         uri: Lance dataset or URI to build index on
         column: Column name to index
-        index_type: Type of index to build (e.g., "IVF_PQ", "IVF_HNSW_PQ")
+        index_type: Type of index to build (e.g., "IVF_PQ", "IVF_RQ",
+            "IVF_HNSW_PQ")
         name: Name of the index (generated if None)
         replace: Whether to replace existing index with the same name (default: True)
-        num_workers: Number of Ray workers to use (keyword-only)
+        num_workers: Maximum number of Ray Pool workers to use (keyword-only)
+        num_segments: Number of fragment batches / index segments to create
+            (keyword-only). Defaults to num_workers for backwards compatibility.
         storage_options: Storage options for the dataset (keyword-only)
         block_size: Block size in bytes to use when loading the dataset (keyword-only)
         ray_remote_args: Options for Ray tasks (keyword-only)
         metric: Distance metric to use (default: "l2")
         num_partitions: Number of IVF partitions (optional)
         num_sub_vectors: Number of PQ sub-vectors (optional)
+        num_bits: Number of bits used to encode each PQ centroid (default: 8)
         sample_rate: Number of rows sampled per IVF partition and PQ centroid (default: 256)
         ivf_centroids: Pre-computed IVF centroids (optional)
         pq_codebook: Pre-computed PQ codebook (optional)
-        **kwargs: Additional arguments to pass to the fragment index build entrypoint
+        rabitq_model: Pre-built RaBitQ model for IVF_RQ. If omitted, Lance-Ray
+            builds one shared model on the driver and sends it to every worker.
+            The model dimension is the vector column width and must be divisible
+            by 8. The ``num_bits`` keyword controls RaBitQ bits per vector
+            dimension and defaults to 1.
+        **kwargs: Additional arguments to pass to the fragment index build entrypoint.
 
     Returns:
         Updated Lance dataset with the index created
@@ -1207,8 +1300,7 @@ def create_index(
     if not column:
         raise ValueError("Column name cannot be empty")
 
-    if num_workers <= 0:
-        raise ValueError(f"num_workers must be positive, got {num_workers}")
+    requested_num_segments = _resolve_num_segments(num_workers, num_segments)
 
     if sample_rate <= 0:
         raise ValueError(f"sample_rate must be positive, got {sample_rate}")
@@ -1267,21 +1359,10 @@ def create_index(
     if name is None:
         name = f"{column}_idx"
 
-    if not replace:
-        index_exists = False
-        try:
-            existing_indices = dataset_obj.list_indices()
-            existing_names = {idx["name"] for idx in existing_indices}
-            index_exists = name in existing_names
-        except (
-            Exception
-        ):  # pragma: no cover - list_indices() not available in older lance versions
-            pass
-        if index_exists:
-            raise ValueError(
-                f"Index with name '{name}' already exists. Set replace=True "
-                "to replace it."
-            )
+    if not replace and _index_exists(dataset_obj, name):
+        raise ValueError(
+            f"Index with name '{name}' already exists. Set replace=True to replace it."
+        )
 
     fragments = dataset_obj.get_fragments()
     if not fragments:
@@ -1289,15 +1370,23 @@ def create_index(
 
     fragment_ids_to_use = [fragment.fragment_id for fragment in fragments]
 
-    if num_workers > len(fragment_ids_to_use):
-        num_workers = len(fragment_ids_to_use)
-        logger.info("Adjusted num_workers to %d to match fragment count", num_workers)
+    if requested_num_segments > len(fragment_ids_to_use):
+        requested_num_segments = len(fragment_ids_to_use)
+        logger.info(
+            "Adjusted num_segments to %d to match fragment count",
+            requested_num_segments,
+        )
 
     ivf_centroids_artifact = ivf_centroids
     pq_codebook_artifact = pq_codebook
+    index_build_kwargs = dict(kwargs)
+    max_iters = index_build_kwargs.get("max_iters")
+    if rabitq_model is not None:
+        index_build_kwargs["rabitq_model"] = rabitq_model
 
     pq_index_types = {"IVF_PQ", "IVF_HNSW_PQ"}
     needs_pq = index_type_name in pq_index_types
+    needs_rq = index_type_name == "IVF_RQ"
 
     # Always perform global IVF training up front so that all shards share the
     # same centroids and number of partitions. The Ray entrypoint owns the
@@ -1320,11 +1409,14 @@ def create_index(
         dimension,
         sample_rate,
     )
-    ivf_model = builder.train_ivf(
-        num_partitions=requested_num_partitions,
-        distance_type=metric_lower,
-        sample_rate=sample_rate,
-    )
+    ivf_train_kwargs: dict[str, Any] = {
+        "num_partitions": requested_num_partitions,
+        "distance_type": metric_lower,
+        "sample_rate": sample_rate,
+    }
+    if max_iters is not None:
+        ivf_train_kwargs["max_iters"] = max_iters
+    ivf_model = builder.train_ivf(**ivf_train_kwargs)
     ivf_centroids_artifact = ivf_model.centroids
     num_partitions = ivf_model.num_partitions
     logger.info(
@@ -1334,9 +1426,12 @@ def create_index(
 
     if needs_pq:
         requested_num_sub_vectors = num_sub_vectors
+        pq_num_bits = index_build_kwargs.get("num_bits", 8)
         logger.info(
-            "Training PQ codebook: requested_num_sub_vectors=%s, sample_rate=%d",
+            "Training PQ codebook: requested_num_sub_vectors=%s, "
+            "num_bits=%d, sample_rate=%d",
             requested_num_sub_vectors,
+            pq_num_bits,
             sample_rate,
         )
         pq_model = _train_pq_for_field_path(
@@ -1344,10 +1439,24 @@ def create_index(
             ivf_model,
             num_subvectors=requested_num_sub_vectors,
             sample_rate=sample_rate,
+            num_bits=pq_num_bits,
+            max_iters=max_iters,
         )
         pq_codebook_artifact = pq_model.codebook
         num_sub_vectors = pq_model.num_subvectors
         logger.info("PQ training completed: num_sub_vectors=%d", num_sub_vectors)
+
+    if needs_rq and index_build_kwargs.get("rabitq_model") is None:
+        num_bits = index_build_kwargs.get("num_bits", 1)
+        logger.info(
+            "Building shared RaBitQ model: dimension=%d, num_bits=%s",
+            dimension,
+            num_bits,
+        )
+        index_build_kwargs["rabitq_model"] = _build_rabitq_model(
+            dimension=dimension,
+            num_bits=num_bits,
+        )
 
     if ivf_centroids_artifact is None:
         raise ValueError(
@@ -1362,12 +1471,23 @@ def create_index(
         )
 
     fragment_batches = _distribute_fragments_balanced(
-        fragments, num_workers=num_workers, logger=logger
+        fragments, num_segments=requested_num_segments, logger=logger
     )
+    pool_workers = min(num_workers, len(fragment_batches))
+    if pool_workers < num_workers:
+        logger.info(
+            "Limiting Ray Pool workers to %d (requested %d) because there are "
+            "only %d non-empty segment batches",
+            pool_workers,
+            num_workers,
+            len(fragment_batches),
+        )
 
     logger.info(
-        "Phase 2: Distributing vector index build across %d workers for %d fragments",
+        "Phase 2: Distributing vector index build across %d segment batches "
+        "using up to %d workers for %d fragments",
         len(fragment_batches),
+        pool_workers,
         len(fragment_ids_to_use),
     )
 
@@ -1388,6 +1508,7 @@ def create_index(
             metric=metric_lower,
             num_partitions=num_partitions,
             num_sub_vectors=num_sub_vectors,
+            sample_rate=sample_rate,
             ivf_centroids=shared_ivf_centroids,
             pq_codebook=shared_pq_codebook,
             storage_options=merged_storage_options,
@@ -1395,13 +1516,13 @@ def create_index(
             namespace_impl=namespace_impl,
             namespace_properties=namespace_properties,
             table_id=table_id,
-            **kwargs,
+            **index_build_kwargs,
         )
 
     results = _map_async_with_pool(
         create_fragment_handler=create_fragment_handler,
         fragment_batches=fragment_batches,
-        num_workers=num_workers,
+        num_workers=pool_workers,
         ray_remote_args=ray_remote_args,
         error_prefix="Failed to complete distributed vector index building",
     )
@@ -1436,10 +1557,11 @@ def create_index(
         name,
     )
     logger.info(
-        "Index ID: %s, Fragments: %d, Workers: %d",
+        "Index ID: %s, Fragments: %d, Segments: %d, Workers: %d",
         index_id,
         len(fragment_ids_to_use),
         len(fragment_batches),
+        pool_workers,
     )
 
     return updated_dataset
@@ -1456,7 +1578,7 @@ def optimize_indices(
     namespace_impl: Optional[str] = None,
     namespace_properties: Optional[dict[str, str]] = None,
     **kwargs: Any,
-) -> "lance.LanceDataset":
+) -> lance.LanceDataset:
     """Optimize indices for newly added data (incremental index update).
 
     As new data arrives it is not added to existing indexes automatically.
