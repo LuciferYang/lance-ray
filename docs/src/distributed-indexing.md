@@ -7,7 +7,13 @@ Lance-Ray provides distributed index building functionality that leverages Ray's
 
 ### Scalar Indexing
 
-`create_scalar_index()` - Distributedly create scalar index using ray. Currently only Inverted/FTS/BTREE/BITMAP are supported. Will add more index type support in the future.
+`create_scalar_index()` - Distributedly create scalar index using ray. Currently Inverted/FTS/BTREE/BITMAP/LABEL_LIST/NGRAM/ZONEMAP/BLOOMFILTER/RTREE are supported. Will add more index type support in the future.
+
+To construct GeoArrow data for an RTREE index, install the PyLance geo extra:
+
+```shell
+pip install "pylance[geo]"
+```
 
 #### How It Works
 The `create_scalar_index` function allows you to create scalar indices for Lance datasets using the Ray distributed computing framework. This function distributes the index building process across multiple Ray worker nodes, with each node responsible for creating uncommitted index segments for a subset of dataset fragments. These segments are then committed as a single index.
@@ -27,6 +33,8 @@ def create_scalar_index(
         Literal["FTS"],
         Literal["NGRAM"],
         Literal["ZONEMAP"],
+        Literal["BLOOMFILTER"],
+        Literal["RTREE"],
         IndexConfig,
     ],
     table_id: Optional[list[str]] = None,
@@ -36,6 +44,7 @@ def create_scalar_index(
     fragment_ids: Optional[list[int]] = None,
     index_uuid: Optional[str] = None,
     num_workers: int = 4,
+    num_segments: Optional[int] = None,
     storage_options: Optional[dict[str, str]] = None,
     block_size: Optional[int] = None,
     namespace_impl: Optional[str] = None,
@@ -52,14 +61,15 @@ def create_scalar_index(
 |-----------|------|-------------|
 | `uri` | `str`, optional | The URI of the Lance dataset. Either `uri` OR (`namespace_impl` + `table_id`) must be provided. |
 | `column` | `str` | Column name to index |
-| `index_type` | `str` or `IndexConfig` | Index type, can be `"INVERTED"`, `"FTS"`, `"BTREE"`, `"BITMAP"`, `"LABEL_LIST"`, `"NGRAM"`, `"ZONEMAP"`, or `IndexConfig` object |
+| `index_type` | `str` or `IndexConfig` | Index type, can be `"INVERTED"`, `"FTS"`, `"BTREE"`, `"BITMAP"`, `"LABEL_LIST"`, `"NGRAM"`, `"ZONEMAP"`, `"BLOOMFILTER"`, `"RTREE"`, or `IndexConfig` object |
 | `table_id` | `list[str]`, optional | The table identifier as a list of strings. |
 | `name` | `str`, optional | Index name, auto-generated if not provided |
 | `replace` | `bool`, optional | Whether to replace existing index with the same name, default is `True` |
 | `train` | `bool`, optional | Whether to train the index, default is `True` |
 | `fragment_ids` | `list[int]`, optional | Optional list of fragment IDs to build index on |
 | `index_uuid` | `str`, optional | Optional fragment UUID for distributed indexing |
-| `num_workers` | `int`, optional | Number of Ray worker nodes to use, default is 4 |
+| `num_workers` | `int`, optional | Maximum number of Ray Pool workers to use, default is 4 |
+| `num_segments` | `int`, optional | Number of fragment batches / index segments to create. Defaults to `num_workers` for backwards compatibility |
 | `storage_options` | `Dict[str, str]`, optional | Storage options for the dataset |
 | `block_size` | `int`, optional | Block size in bytes to use when loading the dataset |
 | `namespace_impl` | `str`, optional | The namespace implementation type (e.g., `"rest"`, `"dir"`) |
@@ -67,7 +77,7 @@ def create_scalar_index(
 | `ray_remote_args` | `Dict[str, Any]`, optional | Ray task options (e.g., `num_cpus`, `resources`) |
 | `**kwargs` | `Any` | Additional arguments passed to `create_scalar_index` |
 
-**Note:** For distributed scalar indexing, currently only `"INVERTED"`, `"FTS"`, `"BTREE"` and `"BITMAP"` index types are supported.
+**Note:** For distributed scalar indexing, currently `"INVERTED"`, `"FTS"`, `"BTREE"`, `"BITMAP"`, `"LABEL_LIST"`, `"NGRAM"`, `"ZONEMAP"`, `"BLOOMFILTER"`, and `"RTREE"` index types are supported.
 
 #### Return Value
 
@@ -80,8 +90,12 @@ The function returns an updated Lance dataset with the newly created index.
 #### Supported Index Types
 The following vector index types are supported for distributed building:
 - `IVF_FLAT`
-- `IVF_SQ`
 - `IVF_PQ`
+- `IVF_RQ`
+- `IVF_SQ`
+- `IVF_HNSW_FLAT`
+- `IVF_HNSW_PQ`
+- `IVF_HNSW_SQ`
 
 #### `create_index`
 
@@ -94,6 +108,7 @@ def create_index(
     *,
     replace: bool = True,
     num_workers: int = 4,
+    num_segments: Optional[int] = None,
     storage_options: Optional[dict[str, str]] = None,
     block_size: Optional[int] = None,
     namespace_impl: Optional[str] = None,
@@ -106,6 +121,7 @@ def create_index(
     sample_rate: int = 256,
     ivf_centroids: Optional["pyarrow.Array"] = None,
     pq_codebook: Optional["pyarrow.Array"] = None,
+    rabitq_model: Optional[str] = None,
     **kwargs: Any,
 ) -> "lance.LanceDataset":
 ```
@@ -116,10 +132,11 @@ def create_index(
 |-----------|------|-------------|
 | `uri` | `str` or `lance.LanceDataset`, optional | Lance dataset object, or its URI. Either `uri` OR (`namespace_impl` + `table_id`) must be provided when using URI mode. If you pass a `lance.LanceDataset` object, namespace parameters are ignored. |
 | `column` | `str` | Vector column name to index |
-| `index_type` | `str` | Vector index type (e.g., `"IVF_PQ"`, `"IVF_SQ"`, `"IVF_FLAT"`) |
+| `index_type` | `str` | Vector index type (e.g., `"IVF_PQ"`, `"IVF_RQ"`, `"IVF_SQ"`, `"IVF_FLAT"`) |
 | `name` | `str`, optional | Index name, auto-generated if not provided |
 | `replace` | `bool`, optional | Whether to replace existing index, default is `True` |
-| `num_workers` | `int`, optional | Number of Ray workers to use, default is 4 |
+| `num_workers` | `int`, optional | Maximum number of Ray Pool workers to use, default is 4 |
+| `num_segments` | `int`, optional | Number of fragment batches / index segments to create. Defaults to `num_workers` for backwards compatibility |
 | `storage_options` | `Dict[str, str]`, optional | Storage options for the dataset. These are merged with the storage options returned by the namespace (if any). |
 | `block_size` | `int`, optional | Block size in bytes to use when loading the dataset |
 | `namespace_impl` | `str`, optional | The namespace implementation type (e.g., `"rest"`, `"dir"`) |
@@ -132,7 +149,20 @@ def create_index(
 | `sample_rate` | `int`, optional | Number of rows sampled per IVF partition and PQ centroid, default is 256 |
 | `ivf_centroids` | `pyarrow.Array`, optional | Pre-computed IVF centroids (advanced) |
 | `pq_codebook` | `pyarrow.Array`, optional | Pre-computed PQ codebook for PQ-based indices (advanced) |
+| `rabitq_model` | `str`, optional | Pre-built RaBitQ model for IVF_RQ. If omitted for IVF_RQ, Lance-Ray builds one shared model on the driver |
+| `num_bits` | `int`, optional | RaBitQ bits per vector dimension for IVF_RQ, default is 1. Passed through to Lance for validation |
 | `**kwargs` | `Any` | Additional arguments to pass through to Lance index creation |
+
+For `IVF_RQ`, Lance-Ray builds one shared RaBitQ rotation model on the driver
+when `rabitq_model` is not provided, then passes that same model to every
+fragment worker. To pin or reuse a model yourself, pass the JSON string returned
+by `lance.lance.indices.build_rq_model(...)` as `rabitq_model`.
+
+The RaBitQ model dimension is the vector column width and must be divisible by
+8. `num_bits` controls how many RaBitQ code bits are used per vector dimension:
+larger values can increase quantized-code fidelity at the cost of more index
+storage and memory. The default is 1, matching Lance's IVF_RQ default, and
+supported values are validated by Lance.
 
 #### Return Value
 
@@ -229,12 +259,19 @@ def vector_search(
 | `oversample_factor` | `float`, optional | Multiplier for local worker candidates. Each worker returns at least `nearest["k"] * oversample_factor` rows before driver-side merge. Must be greater than or equal to 1. |
 | `include_unindexed` | `bool`, optional | Include fragments not covered by vector index segments using separate flat-search fallback plans. Fallback plans use regular fragment scans and compute vector distance in Lance-Ray. Ignored when `fast_search=True`. |
 | `fast_search` | `bool`, optional | Search only indexed data. When enabled, Lance-Ray does not schedule flat-search fallback plans for fragments not covered by vector index segments. |
-| `analyze_plan` | `bool`, optional | If `True`, call `LanceScanner.analyze_plan()` for each planned shard and return a string containing the per-shard analysis instead of executing search and returning a table. |
+| `analyze_plan` | `bool`, optional | If `True`, execute `LanceScanner.analyze_plan()` for each planned shard and return runtime metrics as a string. This skips Lance-Ray's fallback distance computation and global top-k merge, but still executes the underlying scanners. |
 | `scanner_options` | `Dict[str, Any]`, optional | Extra Lance scanner options, such as `batch_size`, `prefilter`, `with_row_id`, or `late_materialization`. Lance-Ray manages `nearest`, `fragments`, `index_segments`, `fast_search`, `limit`, and `offset` internally, so those options cannot be supplied here. |
 
 #### Return Value
 
 The function returns a `pyarrow.Table` containing the global top-k rows sorted by `_distance`. If `analyze_plan=True`, it returns a `str` containing one Lance scanner analysis section per planned shard.
+
+Indexed and unindexed candidates use the same distance convention as Lance:
+L2 is squared Euclidean distance (`sum((q - v) ** 2)`), cosine is
+`1 - cosine_similarity(q, v)`, and dot is `1 - dot(q, v)`. All are sorted in
+ascending order. If `nearest["metric"]` is omitted, flat fallback plans use the
+selected index's metric; when no index exists, the default is L2. Approximate
+index scores can still differ from exact flat-search distances.
 
 ## Examples
 
@@ -255,7 +292,7 @@ updated_dataset = lr.create_scalar_index(
 )
 
 # Verify index creation
-indices = updated_dataset.list_indices()
+indices = updated_dataset.describe_indices()
 print(f"Index list: {indices}")
 
 # Use index for search
@@ -285,7 +322,7 @@ updated_dataset.scanner(filter="id = 100", columns=["id", "text"]).to_table()
 updated_dataset.scanner(filter="id >= 200 AND id < 800", columns=["id", "text"]).to_table()
 ```
 
-### Vector Index (IVF_PQ / IVF_SQ / IVF_FLAT)
+### Vector Index (IVF_PQ / IVF_RQ / IVF_SQ / IVF_FLAT)
 ```python
 import lance_ray as lr
 
@@ -310,6 +347,31 @@ updated_dataset = lr.create_index(
     name="idx_ivf_sq",
     num_workers=4,
     num_partitions=256,
+)
+
+# Build a distributed IVF_RQ index
+updated_dataset = lr.create_index(
+    uri="path/to/dataset.lance",
+    column="vector",
+    index_type="IVF_RQ",
+    name="idx_ivf_rq",
+    num_workers=4,
+    num_partitions=256,
+)
+
+# Or provide a pre-built shared RaBitQ model explicitly.
+from lance.lance import indices
+
+rabitq_model = indices.build_rq_model(dimension=128, num_bits=1)
+updated_dataset = lr.create_index(
+    uri="path/to/dataset.lance",
+    column="vector",
+    index_type="IVF_RQ",
+    name="idx_ivf_rq",
+    num_workers=4,
+    num_partitions=256,
+    num_bits=1,
+    rabitq_model=rabitq_model,
 )
 
 # Build a distributed IVF_FLAT index
@@ -347,6 +409,16 @@ plan = lr.vector_search(
 )
 print(plan)
 ```
+
+### Binary Vector Search
+
+For binary vectors, set `nearest["metric"] = "hamming"`. The fallback requires
+list-like `uint8` vectors containing packed bits and a query of integer bytes
+in `[0, 255]`. It uses the same bit-level Hamming distance as Lance:
+`sum(popcount(q[i] ^ v[i]))`, not the number of unequal bytes. Distances are
+returned as `float32` and sorted in ascending order. For example, the distance
+between `[0, 0]` and `[255, 0]` is 8, not 1. Null vectors and null byte elements
+are rejected by the fallback instead of silently producing a distance.
 
 ### Custom Ray Options
 
@@ -433,13 +505,13 @@ except ValueError as e:
 
 ### Performance Considerations
 
-- For very large datasets, it's recommended to use more powerful CPU/memory ray worker nodes. Increasing `num_workers` can improve index building speed, but requires more computational nodes.
-- Too many num_workers can cause large number of partitions, which cause FTS queries slowness as lots of index partitions need to be loaded when searching.
-- If `num_workers` is greater than the number of fragments, it will be automatically adjusted to match the fragment count
+- For very large datasets, use Ray worker nodes with sufficient CPU and memory. Increasing `num_workers` can improve index build speed when there are enough segment batches to process, but requires more cluster resources.
+- `num_segments` determines the number of index segments. More segments can slow FTS queries because more index segments need to be loaded during search.
+- `num_segments` is capped at the number of fragments, and `num_workers` is capped at the number of non-empty segment batches.
 
 ### Important Notes
 
-- **Index Type Support**: For distributed indexing, currently only `"INVERTED"`/`"FTS"`/`"BTREE"`/`"BITMAP"` index types are supported, even though the function signature accepts other index types.
+- **Index Type Support**: For distributed indexing, currently only `"INVERTED"`/`"FTS"`/`"BTREE"`/`"BITMAP"`/`"ZONEMAP"` index types are supported, even though the function signature accepts other index types.
 - **Default Behavior**: The `replace` parameter defaults to `True`, meaning existing indices with the same name will be replaced without warning. Set `replace=False` to prevent accidental overwrites.
 - **Fragment Selection**: Use `fragment_ids` parameter to build indices on specific fragments only. This is useful for incremental index building or testing.
 - **Error Handling**: When `replace=False` and an index with the same name exists, a `ValueError` or `RuntimeError` will be raised depending on the execution context.

@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+from __future__ import annotations
+
 import inspect
 import logging
 import math
 import pickle
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Union
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, cast
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -66,31 +68,9 @@ def _get_dataset_storage_options(dataset: LanceDataset) -> dict[str, Any]:
 
 def _get_fragment_id(fragment: Any) -> int:
     try:
-        return fragment.fragment_id
+        return cast(int, fragment.fragment_id)
     except AttributeError:
-        return fragment.metadata.id
-
-
-def _get_index_descriptions(dataset: LanceDataset) -> list[Any]:
-    if hasattr(dataset, "describe_indices"):
-        return dataset.describe_indices()
-
-    descriptions = []
-    for index in dataset.list_indices():
-        descriptions.append(
-            {
-                "name": index["name"],
-                "index_type": index.get("type"),
-                "field_names": index.get("fields", []),
-                "segments": [
-                    {
-                        "uuid": index["uuid"],
-                        "fragment_ids": index.get("fragment_ids", set()),
-                    }
-                ],
-            }
-        )
-    return descriptions
+        return cast(int, fragment.metadata.id)
 
 
 def _index_value(index: Any, name: str, default: Any = None) -> Any:
@@ -111,7 +91,7 @@ def _select_vector_index(
     column: str,
     index_name: Optional[str],
 ) -> Any | None:
-    indices = _get_index_descriptions(dataset)
+    indices = dataset.describe_indices()
     for index in indices:
         name = _index_value(index, "name")
         field_names = _index_value(index, "field_names")
@@ -247,7 +227,7 @@ def _pack_search_plan_units(
 
 @lru_cache(maxsize=16)
 def _load_pickled_dataset(pickled_dataset: bytes) -> LanceDataset:
-    return pickle.loads(pickled_dataset)
+    return cast(LanceDataset, pickle.loads(pickled_dataset))
 
 
 @lru_cache(maxsize=16)
@@ -368,6 +348,11 @@ def _execute_flat_fallback_vector_search_plan(
         _get_nearest_metric(nearest),
     )
     table = table.append_column("_distance", pa.array(distances, type=pa.float32()))
+    # Skip filtering when there are no NaNs to avoid copying the table.
+    invalid = pc.is_nan(table["_distance"])
+    if pc.any(invalid).as_py():
+        # Like Lance, exclude NaN before top-k, but preserve infinite distances.
+        table = table.filter(pc.invert(invalid))
     table = _take_top_k(table, candidate_k)
     if drop_vector_column and vector_scan_column in table.column_names:
         table = table.drop_columns([vector_scan_column])
@@ -413,15 +398,51 @@ def _get_nearest_metric(nearest: dict[str, Any]) -> str:
     return str(metric).lower()
 
 
+def _get_index_metric(dataset: LanceDataset, vector_index: Any) -> str:
+    # Recent index metadata records the metric without opening the index files.
+    details = _index_value(vector_index, "details") or {}
+    metric = details.get("metric_type")
+    if metric:
+        return str(metric).lower()
+
+    # Older persisted indexes may not have a metric in their manifest details.
+    name = _index_value(vector_index, "name")
+    statistics = dataset.stats.index_stats(name)
+    metrics = {
+        str(segment.get("metric_type") or "").lower()
+        for segment in statistics.get("indices", [])
+    }
+    if len(metrics) != 1 or "" in metrics:
+        raise ValueError(
+            f"Cannot determine a consistent distance metric for vector index {name!r}"
+        )
+    return metrics.pop()
+
+
 def _compute_vector_distances(
-    vector_column: pa.ChunkedArray,
+    vector_column: pa.ChunkedArray[Any],
     query: Any,
     metric: str,
 ) -> Any:
     import numpy as np
 
-    matrix = _vector_column_to_numpy(vector_column)
-    query_vector = np.asarray(query, dtype=np.float32)
+    if metric == "hamming":
+        vector_type = vector_column.type
+        if not (
+            pa.types.is_list(vector_type)
+            or pa.types.is_large_list(vector_type)
+            or pa.types.is_fixed_size_list(vector_type)
+        ) or not pa.types.is_uint8(vector_type.value_type):
+            raise ValueError(
+                "Hamming fallback requires a list-like uint8 vector column"
+            )
+        if pc.list_flatten(vector_column).null_count:
+            raise ValueError("Hamming fallback does not support null vector elements")
+        matrix = _vector_column_to_numpy(vector_column, dtype=np.uint8)
+        query_vector = np.asarray(query)
+    else:
+        matrix = _vector_column_to_numpy(vector_column)
+        query_vector = np.asarray(query, dtype=np.float32)
     if query_vector.ndim != 1:
         raise ValueError("nearest['q'] must be a one-dimensional vector")
     if matrix.shape[1] != query_vector.shape[0]:
@@ -431,7 +452,8 @@ def _compute_vector_distances(
         )
 
     if metric in ("l2", "euclidean"):
-        return np.linalg.norm(matrix - query_vector, axis=1).astype(np.float32)
+        # Lance returns squared L2, including on the indexed search path.
+        return np.sum((matrix - query_vector) ** 2, axis=1).astype(np.float32)
     if metric == "cosine":
         query_norm = np.linalg.norm(query_vector)
         row_norms = np.linalg.norm(matrix, axis=1)
@@ -439,14 +461,30 @@ def _compute_vector_distances(
         similarities = np.divide(
             matrix @ query_vector,
             denom,
-            out=np.zeros(matrix.shape[0], dtype=np.float32),
+            out=np.full(matrix.shape[0], np.nan, dtype=np.float32),
             where=denom != 0,
         )
         return (1.0 - similarities).astype(np.float32)
     if metric in ("dot", "ip", "inner_product"):
-        return (-(matrix @ query_vector)).astype(np.float32)
+        # Preserve Lance's offset so indexed and flat candidates are comparable.
+        return (1.0 - matrix @ query_vector).astype(np.float32)
     if metric == "hamming":
-        return np.count_nonzero(matrix != query_vector, axis=1).astype(np.float32)
+        if (
+            query_vector.dtype.kind not in "iu"
+            or np.any(query_vector < 0)
+            or np.any(query_vector > 255)
+        ):
+            raise ValueError(
+                "Hamming query must contain integers in the range 0 to 255"
+            )
+        # Lance stores packed bits in uint8 elements: count differing bits, not
+        # differing bytes. A lookup table avoids expanding the matrix with
+        # unpackbits and works on NumPy versions without bitwise_count.
+        popcounts = np.array(
+            [value.bit_count() for value in range(256)], dtype=np.uint8
+        )
+        xor = np.bitwise_xor(matrix, query_vector.astype(np.uint8))
+        return popcounts[xor].sum(axis=1, dtype=np.uint64).astype(np.float32)
 
     raise ValueError(
         "Unsupported fallback vector search metric "
@@ -454,27 +492,32 @@ def _compute_vector_distances(
     )
 
 
-def _vector_column_to_numpy(vector_column: pa.ChunkedArray) -> Any:
+def _vector_column_to_numpy(
+    vector_column: pa.ChunkedArray[Any], *, dtype: Any = None
+) -> Any:
     import numpy as np
+
+    if dtype is None:
+        dtype = np.float32
 
     combined = vector_column.combine_chunks()
 
-    fast = _fixed_size_list_to_matrix(combined)
+    fast = _fixed_size_list_to_matrix(combined, dtype)
     if fast is not None:
         return fast
 
     values = combined.to_pylist()
     if not values:
-        return np.empty((0, 0), dtype=np.float32)
+        return np.empty((0, 0), dtype=dtype)
     if any(value is None for value in values):
         raise ValueError("Fallback vector search does not support null vectors")
-    matrix = np.asarray(values, dtype=np.float32)
+    matrix = np.asarray(values, dtype=dtype)
     if matrix.ndim != 2:
         raise ValueError("Fallback vector search requires a list-like vector column")
     return matrix
 
 
-def _fixed_size_list_to_matrix(array: pa.Array) -> Any | None:
+def _fixed_size_list_to_matrix(array: pa.Array[Any], dtype: Any) -> Any | None:
     """Convert a FixedSizeList vector column to a 2-D matrix without a Python round-trip.
 
     Returns ``None`` (so the caller falls back to the generic, slower
@@ -488,16 +531,17 @@ def _fixed_size_list_to_matrix(array: pa.Array) -> Any | None:
     if array.null_count or len(array) == 0:
         return None
 
-    values = array.values
+    fsl = cast("pa.FixedSizeListArray[Any]", array)
+    values = fsl.values
     if values.null_count:
         return None
 
-    list_size = array.type.list_size
+    list_size = cast("pa.FixedSizeListType[Any]", array.type).list_size
     if len(values) != len(array) * list_size:
         # Offset/sliced child buffer: defer to the safe generic path.
         return None
 
-    flat = np.asarray(values.to_numpy(zero_copy_only=False), dtype=np.float32)
+    flat = np.asarray(values.to_numpy(zero_copy_only=False), dtype=dtype)
     return flat.reshape(len(array), list_size)
 
 
@@ -574,7 +618,7 @@ def _candidate_k(nearest: dict[str, Any], oversample_factor: float) -> tuple[int
 
 
 def vector_search(
-    uri: Optional[Union[str, "lance.LanceDataset"]] = None,
+    uri: Optional[str | lance.LanceDataset] = None,
     *,
     nearest: dict[str, Any],
     index_name: Optional[str] = None,
@@ -609,6 +653,9 @@ def vector_search(
             and ``k``.  The worker-side ``k`` is raised to at least
             ``k * oversample_factor`` before the driver performs the final
             global top-k merge.
+            If ``metric`` is omitted, fallback plans use the selected index's
+            metric, or L2 when no index exists.  L2 distances are squared and
+            dot distances are ``1 - dot(q, v)``, matching Lance.
         index_name: Optional vector index name to use.  If specified and the
             index cannot be found, ``ValueError`` is raised.  If omitted,
             Lance-Ray uses the first vector index covering ``nearest["column"]``.
@@ -635,9 +682,10 @@ def vector_search(
             Ignored when ``fast_search=True``.
         fast_search: Search only indexed data.  When enabled, Lance-Ray does
             not schedule flat-search fallback plans for unindexed fragments.
-        analyze_plan: Return Lance scanner analyze plans instead of executing
-            the query and returning a table.  The result is a string containing
-            one section per planned shard.
+        analyze_plan: Execute Lance scanner analyze plans and return runtime
+            metrics instead of a result table.  The result has one section per
+            planned shard.  This skips Lance-Ray's fallback distance computation
+            and global top-k merge, but still executes the underlying scanners.
         scanner_options: Additional Lance scanner options.  Lance-Ray manages
             ``nearest``, ``fragments``, ``index_segments``, ``fast_search``,
             ``limit``, and ``offset`` internally, so these options cannot be
@@ -727,6 +775,17 @@ def vector_search(
     )
     if not plans:
         return pa.table({})
+
+    if (
+        not analyze_plan
+        and vector_index is not None
+        and not (nearest.get("metric") or nearest.get("distance_type"))
+        and any(not plan.index_segments for plan in plans)
+    ):
+        # Lance infers the index metric for ANN queries. Use the same metric
+        # on flat shards before comparing their distances in the global merge.
+        # Plan analysis returns before computing fallback distances.
+        nearest = {**nearest, "metric": _get_index_metric(dataset, vector_index)}
 
     pickled_dataset = pickle.dumps(dataset)
 
