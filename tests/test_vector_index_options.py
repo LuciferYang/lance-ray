@@ -1,6 +1,7 @@
 """Tests for distributed vector index option handling."""
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -8,6 +9,8 @@ from typing import Any, cast
 
 import pyarrow as pa
 import pytest
+
+from _ray_test_support import attempt_marker, die_once_handler, timed_sleep_handler
 
 
 def _load_index_module_with_stubs() -> ModuleType:
@@ -30,17 +33,17 @@ def _load_index_module_with_stubs() -> ModuleType:
 
     ray = ModuleType("ray")
     ray.ObjectRef = type("ObjectRef", (), {})  # type: ignore[attr-defined]
-    ray_util = ModuleType("ray.util")
-    ray_multiprocessing = ModuleType("ray.util.multiprocessing")
-    ray_multiprocessing.Pool = object  # type: ignore[attr-defined]
 
     sys.modules["lance_ray"] = package
     sys.modules["lance"] = lance
     sys.modules["lance.dataset"] = lance_dataset
     sys.modules["lance.indices"] = lance_indices
+    ray_exceptions = ModuleType("ray.exceptions")
+    ray_exceptions.ActorUnavailableError = type(  # type: ignore[attr-defined]
+        "ActorUnavailableError", (Exception,), {}
+    )
     sys.modules["ray"] = ray
-    sys.modules["ray.util"] = ray_util
-    sys.modules["ray.util.multiprocessing"] = ray_multiprocessing
+    sys.modules["ray.exceptions"] = ray_exceptions
 
     spec = importlib.util.spec_from_file_location(
         "lance_ray.index",
@@ -137,78 +140,146 @@ class _FakeDataset:
         return self
 
 
-def test_map_async_with_pool_closes_and_joins_pool(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The Ray Pool should be joined after close so actors finish cleanup."""
+def test_map_async_with_pool_dispatches_to_idle_workers() -> None:
+    """A batch goes to a free worker instead of queueing behind a slow one.
 
-    events: list[Any] = []
-
-    class FakeAsyncResult:
-        def get(self) -> Any:
-            events.append("get")
-            return [{"status": "success"}]
-
-    class FakePool:
-        def __init__(self, processes: int, ray_remote_args: Any) -> None:
-            events.append(("init", processes, ray_remote_args))
-
-        def map_async(
-            self, fragment_handler: Any, fragment_batches: Any, chunksize: int
-        ) -> Any:
-            events.append(("map_async", fragment_batches, chunksize))
-            return FakeAsyncResult()
-
-        def close(self) -> None:
-            events.append("close")
-
-        def join(self) -> None:
-            events.append("join")
-
-    def create_fragment_handler() -> Any:
-        events.append("create_handler")
-        return lambda fragment_ids: {"status": "success", "fragment_ids": fragment_ids}
-
-    monkeypatch.setattr(index_mod, "Pool", FakePool)
-
-    assert index_mod._map_async_with_pool(
-        create_fragment_handler=create_fragment_handler,
-        fragment_batches=[[0, 1]],
+    With two workers and batches [slow, fast, slow, fast], round-robin
+    submission would put both slow batches on the same worker, one after the
+    other; idle dispatch runs them concurrently on different workers.
+    """
+    results = index_mod._map_async_with_pool(
+        create_fragment_handler=lambda: timed_sleep_handler,
+        fragment_batches=[[200], [5], [200], [5]],
         num_workers=2,
         ray_remote_args={"num_cpus": 1},
         error_prefix="failed",
-    ) == [{"status": "success"}]
-    assert events == [
-        ("init", 2, {"num_cpus": 1}),
-        "create_handler",
-        ("map_async", [[0, 1]], 1),
-        "get",
-        "close",
-        "join",
-    ]
+    )
+
+    assert [r["status"] for r in results] == ["success"] * 4
+    assert results[2]["start"] < results[0]["end"]
 
 
-def test_create_index_passes_global_training_options_to_segment_build(
+def test_map_async_with_pool_retries_failed_tasks(tmp_path: Path) -> None:
+    marker_dir = str(tmp_path)
+
+    def handler(fragment_ids: list[int]) -> dict[str, Any]:
+        attempt = attempt_marker(marker_dir, fragment_ids)
+        if fragment_ids == [1] and attempt == 1:
+            return {"status": "error", "fragment_ids": fragment_ids, "error": "boom"}
+        return {"status": "success", "fragment_ids": fragment_ids}
+
+    results = index_mod._map_async_with_pool(
+        create_fragment_handler=lambda: handler,
+        fragment_batches=[[0], [1], [2]],
+        num_workers=2,
+        ray_remote_args=None,
+        error_prefix="failed",
+        max_task_retries=1,
+    )
+
+    assert [r["fragment_ids"] for r in results] == [[0], [1], [2]]
+    assert [r["status"] for r in results] == ["success"] * 3
+    attempts = sorted(name.split(".")[0] for name in os.listdir(marker_dir))
+    assert attempts == ["0", "1", "1", "2"]
+
+
+def test_map_async_with_pool_reports_exhausted_retries(tmp_path: Path) -> None:
+    marker_dir = str(tmp_path)
+
+    def handler(fragment_ids: list[int]) -> dict[str, Any]:
+        attempt_marker(marker_dir, fragment_ids)
+        return {"status": "error", "fragment_ids": fragment_ids, "error": "boom"}
+
+    results = index_mod._map_async_with_pool(
+        create_fragment_handler=lambda: handler,
+        fragment_batches=[[0]],
+        num_workers=1,
+        ray_remote_args=None,
+        error_prefix="failed",
+        max_task_retries=2,
+    )
+
+    assert results == [{"status": "error", "fragment_ids": [0], "error": "boom"}]
+    assert len(os.listdir(marker_dir)) == 3
+
+
+def test_map_async_with_pool_retries_on_a_live_worker_after_worker_death(
+    tmp_path: Path,
+) -> None:
+    """A batch whose worker dies is retried elsewhere; the dead worker is dropped."""
+    results = index_mod._map_async_with_pool(
+        create_fragment_handler=lambda: die_once_handler(str(tmp_path / "died")),
+        fragment_batches=[[0], [1]],
+        num_workers=2,
+        ray_remote_args=None,
+        error_prefix="failed",
+        max_task_retries=1,
+    )
+
+    assert [r["status"] for r in results] == ["success", "success"]
+
+
+def test_map_async_with_pool_keeps_restartable_workers_after_death(
+    tmp_path: Path,
+) -> None:
+    """With max_restarts, Ray restarts the dead worker and it keeps serving."""
+    results = index_mod._map_async_with_pool(
+        create_fragment_handler=lambda: die_once_handler(str(tmp_path / "died")),
+        fragment_batches=[[0]],
+        num_workers=1,
+        ray_remote_args={"max_restarts": 1},
+        error_prefix="failed",
+        max_task_retries=1,
+    )
+
+    assert results[0]["status"] == "success"
+
+
+def test_map_async_with_pool_fails_when_every_worker_died() -> None:
+    def handler(fragment_ids: list[int]) -> dict[str, Any]:
+        os._exit(1)
+
+    with pytest.raises(RuntimeError, match="failed: every worker has died"):
+        index_mod._map_async_with_pool(
+            create_fragment_handler=lambda: handler,
+            fragment_batches=[[0]],
+            num_workers=1,
+            ray_remote_args=None,
+            error_prefix="failed",
+            max_task_retries=1,
+        )
+
+
+def test_create_index_rejects_negative_max_task_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Global training options must reach driver training and segment builds."""
+    monkeypatch.setattr(index_mod, "_check_pylance_version", lambda: None)
 
-    captured: dict[str, Any] = {}
-    fake_dataset: Any = _FakeDataset()
+    with pytest.raises(ValueError, match="max_task_retries must be non-negative"):
+        index_mod.create_index(
+            uri="memory://fake",
+            column="vector",
+            index_type="IVF_PQ",
+            max_task_retries=-1,
+        )
+
+
+def _patch_create_index(
+    monkeypatch: pytest.MonkeyPatch, fake_dataset: Any, captured: dict[str, Any]
+) -> None:
+    """Fake training, artifact broadcast and the worker pool around create_index."""
 
     class FakeIndicesBuilder:
         dimension = 16
 
         def __init__(self, dataset: Any, column: str) -> None:
             captured["builder_dataset"] = dataset
-            captured["builder_column"] = column
 
         def train_ivf(self, **kwargs: Any) -> Any:
             captured["train_ivf"] = kwargs
             return SimpleNamespace(centroids="ivf_centroids", num_partitions=4)
 
         def train_pq(self, ivf_model: Any, **kwargs: Any) -> Any:
-            captured["train_pq_ivf_model"] = ivf_model
             captured["train_pq"] = kwargs
             return SimpleNamespace(codebook="pq_codebook", num_subvectors=4)
 
@@ -217,7 +288,6 @@ def test_create_index_passes_global_training_options_to_segment_build(
         return "ivf_ref", "pq_ref"
 
     def fake_map_async_with_pool(**kwargs: Any) -> Any:
-        captured["map_kwargs"] = kwargs
         fragment_handler = kwargs["create_fragment_handler"]()
         return [fragment_handler([0, 1])]
 
@@ -230,6 +300,16 @@ def test_create_index_passes_global_training_options_to_segment_build(
         fake_put_vector_index_artifacts,
     )
     monkeypatch.setattr(index_mod, "_map_async_with_pool", fake_map_async_with_pool)
+
+
+def test_create_index_passes_global_training_options_to_segment_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Global training options must reach driver training and segment builds."""
+
+    captured: dict[str, Any] = {}
+    fake_dataset: Any = _FakeDataset()
+    _patch_create_index(monkeypatch, fake_dataset, captured)
 
     updated_dataset: Any = index_mod.create_index(
         uri=fake_dataset,
@@ -707,3 +787,115 @@ def test_vector_fragment_handler_resolves_shared_artifact_refs(
     assert captured["gets"] == [ivf_ref, pq_ref]
     assert fake_dataset.vector_index_kwargs["ivf_centroids"] == "ivf_centroids"
     assert fake_dataset.vector_index_kwargs["pq_codebook"] == "pq_codebook"
+
+
+def _fake_runtime_context(
+    monkeypatch: pytest.MonkeyPatch, resources: dict[str, float]
+) -> None:
+    monkeypatch.setattr(
+        index_mod.ray,  # type: ignore[attr-defined]
+        "get_runtime_context",
+        lambda: SimpleNamespace(get_assigned_resources=lambda: resources),
+        raising=False,
+    )
+
+
+def test_pin_lance_cpu_threads_uses_assigned_cpus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANCE_CPU_THREADS", "unset")
+    monkeypatch.delenv("LANCE_CPU_THREADS")
+    _fake_runtime_context(monkeypatch, {"CPU": 8.0, "memory": 1024})
+
+    index_mod._pin_lance_cpu_threads()
+
+    assert os.environ["LANCE_CPU_THREADS"] == "8"
+
+
+def test_pin_lance_cpu_threads_keeps_explicit_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANCE_CPU_THREADS", "3")
+    _fake_runtime_context(monkeypatch, {"CPU": 8.0})
+
+    index_mod._pin_lance_cpu_threads()
+
+    assert os.environ["LANCE_CPU_THREADS"] == "3"
+
+
+def test_pin_lance_cpu_threads_skips_workers_without_cpus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANCE_CPU_THREADS", "unset")
+    monkeypatch.delenv("LANCE_CPU_THREADS")
+    _fake_runtime_context(monkeypatch, {})
+
+    index_mod._pin_lance_cpu_threads()
+
+    assert "LANCE_CPU_THREADS" not in os.environ
+
+
+def test_vector_fragment_handler_pins_lance_cpu_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANCE_CPU_THREADS", "unset")
+    monkeypatch.delenv("LANCE_CPU_THREADS")
+    _fake_runtime_context(monkeypatch, {"CPU": 16.0})
+    fake_dataset: Any = _FakeDataset()
+    monkeypatch.setattr(index_mod, "LanceDataset", lambda *args, **kwargs: fake_dataset)
+
+    handler = index_mod._handle_vector_fragment_index(
+        dataset_uri="memory://fake",
+        column="vector",
+        index_type="IVF_FLAT",
+        name="vector_idx",
+        index_uuid="vector-index",
+        replace=False,
+        metric="l2",
+        num_partitions=4,
+        num_sub_vectors=None,
+        ivf_centroids=cast(Any, "ivf_centroids"),
+        pq_codebook=None,
+    )
+
+    assert handler([0])["status"] == "success"
+    assert os.environ["LANCE_CPU_THREADS"] == "16"
+
+
+def test_create_index_trains_on_ray_worker_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """training_ray_remote_args runs Phase 1 as a Ray task on the pinned version."""
+
+    captured: dict[str, Any] = {}
+    fake_dataset: Any = _FakeDataset()
+    _patch_create_index(monkeypatch, fake_dataset, captured)
+
+    class FakeTask:
+        def options(self, **kwargs: Any) -> "FakeTask":
+            captured["task_options"] = kwargs
+            return self
+
+        def remote(self, *args: Any, **kwargs: Any) -> Any:
+            captured["task_args"] = (args, kwargs)
+            return index_mod._train_vector_index_models(*args, **kwargs)
+
+    monkeypatch.setattr(index_mod.ray, "remote", lambda fn: FakeTask(), raising=False)  # type: ignore[attr-defined]
+    monkeypatch.setattr(index_mod.ray, "get", lambda value: value, raising=False)  # type: ignore[attr-defined]
+
+    index_mod.create_index(
+        uri=fake_dataset,
+        column="vector",
+        index_type="IVF_PQ",
+        num_workers=2,
+        num_partitions=4,
+        num_sub_vectors=4,
+        accelerator="cuda",
+        training_ray_remote_args={"num_gpus": 1, "num_cpus": 8},
+    )
+
+    assert captured["task_options"] == {"num_gpus": 1, "num_cpus": 8}
+    assert captured["task_args"][0] == (fake_dataset,)
+    assert captured["train_ivf"]["accelerator"] == "cuda"
+    assert "accelerator" not in fake_dataset.vector_index_kwargs
+    assert fake_dataset.commit_kwargs["segments"] == ["segment"]
