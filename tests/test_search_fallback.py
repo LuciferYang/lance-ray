@@ -17,9 +17,7 @@ from lance_ray.search import (
 )
 
 
-def _fixed_size_list_chunked(
-    rows: list[list[float]], dim: int
-) -> pa.ChunkedArray[Any]:
+def _fixed_size_list_chunked(rows: list[list[float]], dim: int) -> pa.ChunkedArray[Any]:
     return pa.chunked_array([pa.array(rows, type=pa.list_(pa.float32(), dim))])
 
 
@@ -33,6 +31,23 @@ def test_fixed_size_list_fast_path_matches_generic() -> None:
     np.testing.assert_array_equal(matrix, np.asarray(rows, dtype=np.float32))
     # The fast path must actually engage for fixed-size-list input.
     assert _fixed_size_list_to_matrix(col.combine_chunks(), np.float32) is not None
+
+
+@pytest.mark.parametrize("value_type", [pa.float16(), pa.float64(), pa.uint8()])
+def test_fast_path_on_sliced_array(value_type: pa.DataType) -> None:
+    rows = np.arange(8).reshape(4, 2)
+    values = pa.array(rows.ravel().astype(value_type.to_pandas_dtype()))
+    array = pa.FixedSizeListArray.from_arrays(values, 2).slice(1, 2)
+
+    matrix = _fixed_size_list_to_matrix(array, np.float32)
+
+    assert matrix is not None
+    np.testing.assert_array_equal(matrix, rows[1:3].astype(np.float32))
+
+
+def test_fast_path_declines_null_elements() -> None:
+    array = pa.array([[1.0, None], [3.0, 4.0]], type=pa.list_(pa.float32(), 2))
+    assert _fixed_size_list_to_matrix(array, np.float32) is None
 
 
 def test_generic_path_for_variable_list() -> None:

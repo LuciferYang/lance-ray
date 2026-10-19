@@ -522,7 +522,7 @@ def _fixed_size_list_to_matrix(array: pa.Array[Any], dtype: Any) -> Any | None:
 
     Returns ``None`` (so the caller falls back to the generic, slower
     ``to_pylist`` path) unless ``array`` is a non-empty, null-free
-    FixedSizeList whose contiguous child buffer can be reshaped directly.
+    FixedSizeList.
     """
     import numpy as np
 
@@ -531,16 +531,12 @@ def _fixed_size_list_to_matrix(array: pa.Array[Any], dtype: Any) -> Any | None:
     if array.null_count or len(array) == 0:
         return None
 
-    fsl = cast("pa.FixedSizeListArray[Any]", array)
-    values = fsl.values
+    # ``flatten`` honours the array's slice offset, unlike ``.values``.
+    values = cast("pa.FixedSizeListArray[Any]", array).flatten()
     if values.null_count:
         return None
 
     list_size = cast("pa.FixedSizeListType[Any]", array.type).list_size
-    if len(values) != len(array) * list_size:
-        # Offset/sliced child buffer: defer to the safe generic path.
-        return None
-
     flat = np.asarray(values.to_numpy(zero_copy_only=False), dtype=dtype)
     return flat.reshape(len(array), list_size)
 
