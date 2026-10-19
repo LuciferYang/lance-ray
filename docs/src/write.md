@@ -11,6 +11,7 @@ write_lance(
     schema=None, 
     mode="create", 
     target_bases=None,
+    target_all_bases=None,
     storage_options=None,
     namespace_impl=None,
     namespace_properties=None,
@@ -27,6 +28,7 @@ Write a Ray Dataset to Lance format.
 - `schema`: Optional PyArrow schema
 - `mode`: Write mode - "create", "append", or "overwrite"
 - `target_bases`: Optional list of registered base names or base path URIs where new data files should be written. In `create` mode, entries must match `initial_bases`; in `append` and `overwrite` modes, entries must match bases already registered in the dataset manifest
+- `target_all_bases`: Select all registered bases, including primary storage when `True` and excluding it when `False`. `False` requires at least one registered base. `None` (default) leaves base selection unchanged. Mutually exclusive with non-empty `target_bases`
 - `min_rows_per_file`: Minimum rows per file (default: 1024 * 1024)
 - `max_rows_per_file`: Maximum rows per file (default: 64 * 1024 * 1024)
 - `data_storage_version`: Optional data storage version
@@ -49,3 +51,55 @@ merged into these values and passed to Lance writers on Ray workers.
 For append mode, provide either `uri` or `namespace_impl` + `table_id`, not both.
 For create and overwrite modes with namespace parameters, the namespace determines
 the registered table location.
+
+### Blob storage formats
+
+`data_storage_version=None` uses PyLance's default stable format. Legacy blob
+columns declared with `lance-encoding:blob=true` field metadata are supported by
+file formats 2.0 and 2.1. When the version is omitted, `write_lance` rejects a
+legacy blob schema before dispatching the write. To write these columns,
+explicitly select a compatible format for both regular and streaming writes,
+for example:
+
+```python
+write_lance(ds, uri, data_storage_version="2.1")
+```
+
+To write blob columns in file formats 2.2 and later, use the Blob v2 extension
+type (`lance.blob.v2`), constructed with `lance.blob_field` and `lance.blob_array`.
+
+## Write retries
+
+`write_lance` uses `LanceDatasink`, which allows up to ten fragment write attempts
+for matching I/O errors. `write_fragment` and `LanceFragmentWriter` use one attempt
+unless `retry_params["max_attempts"]` is explicitly greater than one.
+
+Retries in `write_fragment` require a replayable iterable, such as a list or tuple,
+or a factory that returns fresh, logically equivalent input for each attempt.
+For a generator function `read_blocks`, pass the function itself to enable replay:
+
+```python
+write_fragment(read_blocks(), "single.lance")  # Single streaming attempt.
+
+write_fragment(
+    read_blocks,
+    "retry.lance",
+    retry_params={
+        "description": "write lance fragments",
+        "match": ["LanceError(IO)"],
+        "max_attempts": 3,
+        "max_backoff_s": 8,
+    },
+)
+```
+
+Retries use fresh readers without IPC or temporary-file staging. `LanceDatasink`
+retains all block references for a write call without copying Arrow data, which
+may extend their memory lifetime. `max_bytes_per_file` does not limit that memory.
+`LanceFragmentWriter` reruns its transform on each attempt; the transform must
+produce equivalent output and handle repeated side effects. Returning the same
+generator from a factory is not sufficient for replay.
+
+Before returning fragments, `write_fragment` checks their total row count against
+the input and raises `RuntimeError` on a mismatch. This does not validate row
+contents, provide job-wide exactly-once semantics, or clean up failed-write files.
