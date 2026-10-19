@@ -5,19 +5,23 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from typing import Any, Literal, Optional, TypeAlias, cast, get_args
 
 import lance
 import pyarrow as pa
 import ray
+from lance.bitmap import Bitmap
 from lance.dataset import Index, IndexConfig, LanceDataset
 from lance.indices import IndicesBuilder
 from packaging import version
+from ray.exceptions import ActorUnavailableError
 
 from .field_path import resolve_arrow_field_path, resolve_dataset_field_path
-from .pool import get_or_create_pool
 from .utils import (
     get_namespace_kwargs,
     has_namespace_params,
@@ -138,6 +142,13 @@ def _distribute_fragments_balanced(
     return non_empty_batches
 
 
+class _BatchWorker:
+    """Ray actor that runs one fragment-batch handler call at a time."""
+
+    def run(self, handler: _FragmentHandler, fragment_ids: list[int]) -> dict[str, Any]:
+        return handler(fragment_ids)
+
+
 def _map_async_with_pool(
     create_fragment_handler: Callable[[], _FragmentHandler],
     fragment_batches: list[list[int]],
@@ -145,28 +156,88 @@ def _map_async_with_pool(
     num_workers: int,
     ray_remote_args: Optional[dict[str, Any]],
     error_prefix: str,
+    max_task_retries: int = 0,
 ) -> list[dict[str, Any]]:
-    """Run fragment tasks in a Ray-backed multiprocessing Pool.
+    """Run fragment batches on a pool of Ray actors, one batch per idle worker.
 
-    This helper encapsulates the common Pool.map_async + get + error wrapping
-    logic so that both scalar and vector distributed index builders can share
-    the same implementation. The global Pool is reused when one is configured
-    via init_global_pool/set_global_pool.
+    Each batch is handed to whichever worker is idle at that moment, so a slow
+    node only delays the batches it is actually running. (Ray's
+    ``multiprocessing.Pool`` assigns batches round-robin at submission time,
+    which makes a map of N batches wait for the slowest worker's fixed share
+    of N.) Batches whose handler returned ``{"status": "error"}`` or whose
+    Ray task/actor failed are resubmitted immediately, up to
+    ``max_task_retries`` times each, rather than after every other batch has
+    finished; handlers must therefore be idempotent.
+
+    Workers are actors created with ``ray_remote_args`` (``num_cpus=0`` unless
+    given, like Ray's Pool). A worker whose process dies is dropped from the
+    pool unless ``{"max_restarts": ...}`` is set, in which case Ray restarts
+    it and it keeps receiving batches.
     """
+    remote_args = {"num_cpus": 0, **(ray_remote_args or {})}
+    worker_cls: Any = ray.remote(**remote_args)(_BatchWorker)
+    workers: list[Any] = [worker_cls.remote() for _ in range(num_workers)]
     try:
-        with get_or_create_pool(
-            processes=num_workers, ray_remote_args=ray_remote_args
-        ) as pool:
-            fragment_handler = create_fragment_handler()
-            results: list[dict[str, Any]] = pool.map_async(
-                fragment_handler,
-                fragment_batches,
-                chunksize=1,
-            ).get()
-    except Exception as exc:  # pragma: no cover - exercised via integration tests
+        fragment_handler = create_fragment_handler()
+        results: dict[int, dict[str, Any]] = {}
+        pending: deque[tuple[int, int]] = deque(
+            (index, 0) for index in range(len(fragment_batches))
+        )
+        idle: list[Any] = []
+        # A worker joins the idle list once Ray has actually started it, so a
+        # batch never queues on an actor still waiting for cluster resources.
+        starting: dict[Any, Any] = {w.__ray_ready__.remote(): w for w in workers}
+        in_flight: dict[Any, tuple[Any, int, int]] = {}
+        while pending or in_flight:
+            while pending and idle:
+                index, attempt = pending.popleft()
+                worker = idle.pop()
+                ref = worker.run.remote(fragment_handler, fragment_batches[index])
+                in_flight[ref] = (worker, index, attempt)
+            if not in_flight and not starting:
+                raise RuntimeError("every worker has died")
+            [ref], _ = ray.wait(list(in_flight) + list(starting), num_returns=1)
+            if ref in starting:
+                worker = starting.pop(ref)
+                try:
+                    ray.get(ref)
+                    idle.append(worker)
+                except ActorUnavailableError:
+                    # Restarting under max_restarts: probe again shortly.
+                    time.sleep(0.5)
+                    starting[worker.__ray_ready__.remote()] = worker
+                except Exception as exc:
+                    logger.warning(
+                        "Worker unavailable (%s); dropping it. Pass max_restarts "
+                        "in ray_remote_args to restart dead workers",
+                        exc,
+                    )
+                continue
+            worker, index, attempt = in_flight.pop(ref)
+            try:
+                result = ray.get(ref)
+                idle.append(worker)
+            except Exception as exc:
+                result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+                # A live worker is ready again at once; a dead one is dropped
+                # (or, with max_restarts, restarted) by the start path above.
+                starting[worker.__ray_ready__.remote()] = worker
+            results[index] = result
+            if result.get("status") != "success" and attempt < max_task_retries:
+                logger.warning(
+                    "Batch %d failed (attempt %d of %d): %s; resubmitting",
+                    index,
+                    attempt + 1,
+                    max_task_retries + 1,
+                    result.get("error"),
+                )
+                pending.append((index, attempt + 1))
+        return [results[i] for i in range(len(fragment_batches))]
+    except Exception as exc:
         raise RuntimeError(f"{error_prefix}: {exc}") from exc
-
-    return results
+    finally:
+        for worker in workers:
+            ray.kill(worker)
 
 
 def _resolve_num_segments(num_workers: int, num_segments: Optional[int]) -> int:
@@ -288,9 +359,7 @@ def _handle_scalar_segment_index(
 
             segment_index = dataset.create_index_uncommitted(
                 column=column,
-                # pylance annotates this as ``str`` but accepts an
-                # ``IndexConfig`` too (see ``_prepare_scalar_index_request``).
-                index_type=index_type,  # type: ignore[arg-type]
+                index_type=index_type,
                 name=name,
                 replace=replace,
                 train=train,
@@ -784,7 +853,7 @@ def create_scalar_index(
         name=name,
         fields=fields,
         dataset_version=dataset.version,
-        fragment_ids=set(fragment_ids_to_use),
+        fragment_ids=Bitmap(fragment_ids_to_use),
         index_version=0,
     )
 
@@ -931,11 +1000,9 @@ class _NestedVectorIndicesBuilder:
             fragment_ids,
             num_bits=num_bits,
         )
-        # ``train_pq_model`` is annotated as returning a generic ``pa.Array``
-        # upstream, but always produces a fixed-size-list codebook.
         return PqModel(
             num_subvectors,
-            cast("pa.FixedSizeListArray[Any]", codebook),
+            codebook,
             num_bits=num_bits,
         )
 
@@ -1136,6 +1203,24 @@ def _validate_metric(metric: str) -> str:
     return metric_lower
 
 
+def _pin_lance_cpu_threads() -> None:
+    """Size Lance's compute thread pool to this worker's Ray CPU allocation.
+
+    Lance sizes its pools from the host core count, so two 8-CPU workers on a
+    16-core node would each start 16 compute threads and oversubscribe the
+    node. Must run before the process makes its first Lance call; an explicit
+    ``LANCE_CPU_THREADS`` is left untouched.
+    """
+    if "LANCE_CPU_THREADS" in os.environ:
+        return
+    try:
+        cpus = ray.get_runtime_context().get_assigned_resources().get("CPU", 0)
+    except Exception:  # not running inside a Ray worker
+        return
+    if cpus >= 1:
+        os.environ["LANCE_CPU_THREADS"] = str(int(cpus))
+
+
 def _handle_vector_fragment_index(
     dataset_uri: str,
     column: str,
@@ -1160,6 +1245,7 @@ def _handle_vector_fragment_index(
 
     def func(fragment_ids: list[int]) -> dict[str, Any]:
         try:
+            _pin_lance_cpu_threads()
             if not fragment_ids:
                 raise ValueError("fragment_ids cannot be empty")
 
@@ -1235,6 +1321,98 @@ def _handle_vector_fragment_index(
     return func
 
 
+def _train_vector_index_models(
+    dataset: LanceDataset,
+    *,
+    column: str,
+    index_type_name: str,
+    metric: str,
+    num_partitions: Optional[int],
+    num_sub_vectors: Optional[int],
+    sample_rate: int,
+    accelerator: Optional[Any],
+    build_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Phase 1: train the IVF/PQ/RaBitQ artifacts shared by every segment.
+
+    ``build_kwargs`` are the extra :func:`create_index` keywords
+    (``max_iters``, ``num_bits``, ``rabitq_model``). Runs on the driver, or as
+    a Ray task when :func:`create_index` is given ``training_ray_remote_args``:
+    a ``LanceDataset`` pickles with its version and manifest, so the task sees
+    exactly the data the build was planned on.
+    """
+    max_iters = build_kwargs.get("max_iters")
+    num_bits = build_kwargs.get("num_bits")
+    rabitq_model = build_kwargs.get("rabitq_model")
+    field = resolve_arrow_field_path(dataset.schema, column).field
+    builder = _indices_builder_for_field_path(dataset, column, field)
+    dimension = builder.dimension
+
+    logger.info(
+        "Phase 1: Training IVF (index_type=%s, metric=%s, "
+        "requested_num_partitions=%s, num_rows=%d, dimension=%d, "
+        "sample_rate=%d, accelerator=%s)",
+        index_type_name,
+        metric,
+        num_partitions,
+        dataset.count_rows(),
+        dimension,
+        sample_rate,
+        accelerator,
+    )
+    ivf_train_kwargs: dict[str, Any] = {
+        "num_partitions": num_partitions,
+        "distance_type": metric,
+        "sample_rate": sample_rate,
+    }
+    if max_iters is not None:
+        ivf_train_kwargs["max_iters"] = max_iters
+    if accelerator is not None:
+        ivf_train_kwargs["accelerator"] = accelerator
+    ivf_model = builder.train_ivf(**ivf_train_kwargs)
+    num_partitions = ivf_model.num_partitions
+    logger.info("IVF training completed: num_partitions=%d", num_partitions)
+
+    pq_codebook = None
+    if index_type_name in {"IVF_PQ", "IVF_HNSW_PQ"}:
+        pq_num_bits = 8 if num_bits is None else num_bits
+        logger.info(
+            "Training PQ codebook: requested_num_sub_vectors=%s, "
+            "num_bits=%d, sample_rate=%d",
+            num_sub_vectors,
+            pq_num_bits,
+            sample_rate,
+        )
+        pq_model = _train_pq_for_field_path(
+            builder,
+            ivf_model,
+            num_subvectors=num_sub_vectors,
+            sample_rate=sample_rate,
+            num_bits=pq_num_bits,
+            max_iters=max_iters,
+        )
+        pq_codebook = pq_model.codebook
+        num_sub_vectors = pq_model.num_subvectors
+        logger.info("PQ training completed: num_sub_vectors=%d", num_sub_vectors)
+
+    if index_type_name == "IVF_RQ" and rabitq_model is None:
+        rq_num_bits = 1 if num_bits is None else num_bits
+        logger.info(
+            "Building shared RaBitQ model: dimension=%d, num_bits=%s",
+            dimension,
+            rq_num_bits,
+        )
+        rabitq_model = _build_rabitq_model(dimension=dimension, num_bits=rq_num_bits)
+
+    return {
+        "ivf_centroids": ivf_model.centroids,
+        "pq_codebook": pq_codebook,
+        "num_partitions": num_partitions,
+        "num_sub_vectors": num_sub_vectors,
+        "rabitq_model": rabitq_model,
+    }
+
+
 def create_index(
     uri: Optional[str | lance.LanceDataset] = None,
     column: str = "",
@@ -1250,6 +1428,9 @@ def create_index(
     namespace_properties: Optional[dict[str, str]] = None,
     table_id: Optional[list[str]] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
+    max_task_retries: int = 0,
+    training_ray_remote_args: Optional[dict[str, Any]] = None,
+    accelerator: Optional[Any] = None,
     metric: str = "l2",
     num_partitions: Optional[int] = None,
     num_sub_vectors: Optional[int] = None,
@@ -1277,6 +1458,20 @@ def create_index(
         storage_options: Storage options for the dataset (keyword-only)
         block_size: Block size in bytes to use when loading the dataset (keyword-only)
         ray_remote_args: Options for Ray tasks (keyword-only)
+        max_task_retries: How many times a failed fragment batch is
+            resubmitted to another worker before the build fails. Batches are
+            retried as soon as they fail, so a transient object-store error
+            costs one batch rather than a build (default: 0)
+        training_ray_remote_args: When set, Phase 1 (IVF/PQ training and the
+            RaBitQ model) runs as a Ray task with these options instead of on
+            the driver, e.g. ``{"num_cpus": 16, "memory": 64 * 2**30}`` to
+            keep a resource-poor head node out of k-means, or
+            ``{"num_gpus": 1}`` together with ``accelerator="cuda"`` to train
+            on a GPU node. The task receives the dataset pinned to the
+            version the build was planned on (optional)
+        accelerator: Accelerator for Phase 1 IVF centroid training, e.g.
+            ``"cuda"`` or ``"mps"`` (optional). It is not forwarded to the
+            fragment workers, whose builds always run on CPU.
         metric: Distance metric to use (default: "l2")
         num_partitions: Number of IVF partitions (optional)
         num_sub_vectors: Number of PQ sub-vectors (optional)
@@ -1304,6 +1499,11 @@ def create_index(
 
     if sample_rate <= 0:
         raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+
+    if max_task_retries < 0:
+        raise ValueError(
+            f"max_task_retries must be non-negative, got {max_task_retries}"
+        )
 
     if block_size is not None and block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}")
@@ -1354,7 +1554,6 @@ def create_index(
             f"Column '{column}' not found. Available: {available_columns}"
         ) from exc
     column = resolved_column.path
-    field = resolved_column.field
 
     if name is None:
         name = f"{column}_idx"
@@ -1377,98 +1576,40 @@ def create_index(
             requested_num_segments,
         )
 
-    ivf_centroids_artifact = ivf_centroids
-    pq_codebook_artifact = pq_codebook
     index_build_kwargs = dict(kwargs)
-    max_iters = index_build_kwargs.get("max_iters")
     if rabitq_model is not None:
         index_build_kwargs["rabitq_model"] = rabitq_model
-
-    pq_index_types = {"IVF_PQ", "IVF_HNSW_PQ"}
-    needs_pq = index_type_name in pq_index_types
-    needs_rq = index_type_name == "IVF_RQ"
 
     # Always perform global IVF training up front so that all shards share the
     # same centroids and number of partitions. The Ray entrypoint owns the
     # lifecycle of these artifacts and distributes them to workers.
-    logger.info(
-        "Phase 1: Training IVF centroids (index_type=%s, metric=%s)",
-        index_type_name,
-        metric_lower,
-    )
-    builder = _indices_builder_for_field_path(dataset_obj, column, field)
-    num_rows = dataset_obj.count_rows()
-    dimension = builder.dimension
-
-    requested_num_partitions = num_partitions
-    logger.info(
-        "Training IVF with requested_num_partitions=%s, num_rows=%d, "
-        "dimension=%d, sample_rate=%d",
-        requested_num_partitions,
-        num_rows,
-        dimension,
-        sample_rate,
-    )
-    ivf_train_kwargs: dict[str, Any] = {
-        "num_partitions": requested_num_partitions,
-        "distance_type": metric_lower,
+    training_kwargs: dict[str, Any] = {
+        "column": column,
+        "index_type_name": index_type_name,
+        "metric": metric_lower,
+        "num_partitions": num_partitions,
+        "num_sub_vectors": num_sub_vectors,
         "sample_rate": sample_rate,
+        "accelerator": accelerator,
+        "build_kwargs": index_build_kwargs,
     }
-    if max_iters is not None:
-        ivf_train_kwargs["max_iters"] = max_iters
-    ivf_model = builder.train_ivf(**ivf_train_kwargs)
-    ivf_centroids_artifact = ivf_model.centroids
-    num_partitions = ivf_model.num_partitions
-    logger.info(
-        "IVF training completed: num_partitions=%d",
-        num_partitions,
-    )
-
-    if needs_pq:
-        requested_num_sub_vectors = num_sub_vectors
-        pq_num_bits = index_build_kwargs.get("num_bits", 8)
+    if training_ray_remote_args is None:
+        phase1 = _train_vector_index_models(dataset_obj, **training_kwargs)
+    else:
         logger.info(
-            "Training PQ codebook: requested_num_sub_vectors=%s, "
-            "num_bits=%d, sample_rate=%d",
-            requested_num_sub_vectors,
-            pq_num_bits,
-            sample_rate,
+            "Phase 1: Training on a Ray worker with options %s",
+            training_ray_remote_args,
         )
-        pq_model = _train_pq_for_field_path(
-            builder,
-            ivf_model,
-            num_subvectors=requested_num_sub_vectors,
-            sample_rate=sample_rate,
-            num_bits=pq_num_bits,
-            max_iters=max_iters,
-        )
-        pq_codebook_artifact = pq_model.codebook
-        num_sub_vectors = pq_model.num_subvectors
-        logger.info("PQ training completed: num_sub_vectors=%d", num_sub_vectors)
+        train_fn: Any = _train_vector_index_models
+        train_task = ray.remote(train_fn).options(**training_ray_remote_args)
+        phase1 = ray.get(train_task.remote(dataset_obj, **training_kwargs))
 
-    if needs_rq and index_build_kwargs.get("rabitq_model") is None:
-        num_bits = index_build_kwargs.get("num_bits", 1)
-        logger.info(
-            "Building shared RaBitQ model: dimension=%d, num_bits=%s",
-            dimension,
-            num_bits,
-        )
-        index_build_kwargs["rabitq_model"] = _build_rabitq_model(
-            dimension=dimension,
-            num_bits=num_bits,
-        )
-
-    if ivf_centroids_artifact is None:
-        raise ValueError(
-            "ivf_centroids must be provided or trainable for IVF-based "
-            "distributed vector indices"
-        )
-
-    if needs_pq and pq_codebook_artifact is None:
-        raise ValueError(
-            "pq_codebook must be provided or trainable for PQ-based "
-            "distributed vector indices"
-        )
+    ivf_centroids_artifact = phase1["ivf_centroids"]
+    pq_codebook_artifact = phase1["pq_codebook"]
+    num_partitions = phase1["num_partitions"]
+    num_sub_vectors = phase1["num_sub_vectors"]
+    if phase1["rabitq_model"] is not None:
+        index_build_kwargs["rabitq_model"] = phase1["rabitq_model"]
 
     fragment_batches = _distribute_fragments_balanced(
         fragments, num_segments=requested_num_segments, logger=logger
@@ -1525,6 +1666,7 @@ def create_index(
         num_workers=pool_workers,
         ray_remote_args=ray_remote_args,
         error_prefix="Failed to complete distributed vector index building",
+        max_task_retries=max_task_retries,
     )
 
     failed_results = [r for r in results if r.get("status") == "error"]
