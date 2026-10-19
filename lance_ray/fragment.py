@@ -5,12 +5,14 @@ import inspect
 import pickle
 import warnings
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
+from contextlib import ExitStack
 from itertools import chain
 from typing import (
     TYPE_CHECKING,
     Any,
     Literal,
     Optional,
+    TypeAlias,
     Union,
     cast,
 )
@@ -24,6 +26,9 @@ if TYPE_CHECKING:
     import pandas as pd
 
 __all__ = [
+    "FragmentBlock",
+    "FragmentStream",
+    "FragmentStreamFactory",
     "LanceFragmentWriter",
     "write_fragment",
 ]
@@ -35,17 +40,20 @@ from .utils import (
     normalize_initial_bases,
 )
 
+FragmentBlock: TypeAlias = Union[pa.Table, "pd.DataFrame", dict[str, Any]]
+FragmentStream: TypeAlias = Iterable[FragmentBlock]
+FragmentStreamFactory: TypeAlias = Callable[[], FragmentStream]
+
 
 def write_fragment(
-    stream: Iterable[Union[pa.Table, "pd.DataFrame", dict[str, Any]]],
+    stream: FragmentStream | FragmentStreamFactory,
     uri: str,
     *,
     schema: Optional[pa.Schema] = None,
     mode: Literal["create", "append", "overwrite"] = "append",
     max_rows_per_file: int = 64 * 1024 * 1024,
     max_bytes_per_file: Optional[int] = None,
-    # Only useful for v1 writer. ``None`` defers to the pylance writer default,
-    # which pylance's own annotation (``int``) does not model.
+    # Only useful for v1 writer. ``None`` defers to the pylance writer default.
     max_rows_per_group: Optional[int] = 1024,
     data_storage_version: Optional[str] = None,
     enable_stable_row_ids: bool = False,
@@ -53,6 +61,7 @@ def write_fragment(
     base_store_params: Optional[dict[str, dict[str, Any]]] = None,
     initial_bases: Optional[list[Any]] = None,
     target_bases: Optional[list[str]] = None,
+    target_all_bases: Optional[bool] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
     namespace_impl: Optional[str] = None,
@@ -60,73 +69,35 @@ def write_fragment(
     table_id: Optional[list[str]] = None,
     retry_params: Optional[dict[str, Any]] = None,
 ) -> list[tuple["FragmentMetadata", pa.Schema]]:
-    """Write a stream of blocks into one or more uncommitted Lance fragments.
+    """Write uncommitted fragments, checking their total row count against input.
 
-    The returned fragments are not yet part of any dataset version; callers
-    commit them via a ``LanceOperation`` (e.g. ``Append`` or ``Overwrite``).
+    Without an explicit ``retry_params["max_attempts"]``, consume the input
+    once using a streaming reader. Multiple attempts require a replayable
+    iterable or a zero-argument factory returning a fresh stream per attempt;
+    directly supplied one-shot iterators are rejected before consumption.
+    The caller must ensure each iteration produces complete, logically
+    equivalent input. A factory returning the same generator is not sufficient.
 
-    Parameters
-    ----------
-    stream : iterable of pyarrow.Table or pandas.DataFrame
-        The blocks of data to write. An empty stream yields no fragments.
-    uri : str
-        The dataset URI the fragments are written for.
-    schema : pyarrow.Schema, optional
-        The schema of the data. If None, it is inferred from the first block.
-    mode : {"create", "append", "overwrite"}, default "append"
-        Fragment write mode passed to pylance. "append" validates fragments
-        against the existing dataset schema (rejecting columns not present in
-        it); "create" and "overwrite" assign new field ids for the incoming schema
-        (schema evolution). Note the high-level ``write_lance`` defaults to
-        "create", while this lower-level helper defaults to "append" to preserve
-        append-validation semantics for direct callers.
+    Each attempt recreates the reader and infers its schema independently.
+    Factory/reiterable-created iterators supporting ``close()`` are closed on
+    exit; caller-supplied one-shot iterators remain the caller's responsibility.
+    No input is staged or serialized for replay. Row-count validation does not
+    check content equivalence or clean up files from failed attempts.
 
-    Returns
-    -------
-    list of (FragmentMetadata, pyarrow.Schema)
-        One entry per written fragment, paired with the schema to commit.
-
-    Notes
-    -----
-    The remaining parameters mirror :class:`LanceFragmentWriter`.
+    ``mode`` is the fragment write mode passed to pylance. "append" validates
+    fragments against the existing dataset schema (rejecting columns not
+    present in it); "create" and "overwrite" assign new field ids for the
+    incoming schema (schema evolution). The high-level ``write_lance``
+    defaults to "create", while this helper defaults to "append" to keep
+    append validation for direct callers.
     """
     from lance.dependencies import _PANDAS_AVAILABLE
     from lance.dependencies import pandas as pd
     from lance.fragment import DEFAULT_MAX_BYTES_PER_FILE, write_fragments
 
-    stream_iter = iter(stream)
-    try:
-        first = next(stream_iter)
-    except StopIteration:
-        return []
-
-    if schema is None:
-        if _PANDAS_AVAILABLE and isinstance(first, pd.DataFrame):
-            schema = pa.Schema.from_pandas(first).remove_metadata()
-        elif isinstance(first, dict):
-            tbl = pa.Table.from_pydict(first)
-            schema = tbl.schema.remove_metadata()
-        else:
-            # Neither a pandas DataFrame nor a dict, so the block is an Arrow
-            # table (a DataFrame cannot reach here: it implies pandas is
-            # importable, which makes ``_PANDAS_AVAILABLE`` true).
-            schema = cast(pa.Table, first).schema
-
-    if schema is None or len(schema.names) == 0:
-        return []
-
-    stream = chain([first], stream_iter)
-
-    def record_batch_converter() -> Iterator[pa.RecordBatch]:
-        for block in stream:
-            tbl = pd_to_arrow(block, schema)
-            yield from tbl.to_batches()
-
     max_bytes_per_file = (
         DEFAULT_MAX_BYTES_PER_FILE if max_bytes_per_file is None else max_bytes_per_file
     )
-
-    reader = pa.RecordBatchReader.from_batches(schema, record_batch_converter())
 
     # Use default retry params if not provided
     if retry_params is None:
@@ -136,36 +107,46 @@ def write_fragment(
             "max_attempts": 1,
             "max_backoff_s": 0,
         }
+    else:
+        # Override Ray's default of ten attempts without changing the caller's dict.
+        retry_params = {"max_attempts": 1, **retry_params}
 
-    write_kwargs = get_write_fragments_kwargs(
-        namespace_impl, namespace_properties, table_id
-    )
-    initial_bases_kwargs: dict[str, Any] = {}
-    if initial_bases:
-        initial_bases_kwargs["initial_bases"] = materialize_initial_bases(initial_bases)
+    if retry_params["max_attempts"] > 1 and isinstance(stream, Iterator):
+        raise TypeError(
+            "Retry-enabled write_fragment requires a stream factory or a "
+            "replayable iterable, not a one-shot Iterator. Pass the generator "
+            "function instead of calling it, or use a list or tuple."
+        )
 
-    optional_write_kwargs = _get_optional_write_fragments_kwargs(
-        write_fragments,
-        target_bases=target_bases,
-        base_store_params=base_store_params,
-        external_blob_mode=external_blob_mode,
-        allow_external_blob_outside_bases=allow_external_blob_outside_bases,
-    )
+    def _write_fragments(
+        reader: pa.RecordBatchReader, attempt_schema: pa.Schema
+    ) -> list["FragmentMetadata"]:
+        write_kwargs = get_write_fragments_kwargs(
+            namespace_impl, namespace_properties, table_id
+        )
+        initial_bases_kwargs: dict[str, Any] = {}
+        if initial_bases:
+            initial_bases_kwargs["initial_bases"] = materialize_initial_bases(
+                initial_bases
+            )
 
-    def _write_fragments() -> list["FragmentMetadata"]:
-        # ``write_fragments`` is overloaded on ``return_transaction``. The
-        # version-dependent kwargs are assembled dynamically, which makes mypy
-        # pick the ``return_transaction=True`` overload; ``return_transaction``
-        # is left at its default here, so a list of fragments comes back.
-        return write_fragments(  # type: ignore[return-value]
+        optional_write_kwargs = _get_optional_write_fragments_kwargs(
+            write_fragments,
+            target_bases=target_bases,
+            target_all_bases=target_all_bases,
+            base_store_params=base_store_params,
+            external_blob_mode=external_blob_mode,
+            allow_external_blob_outside_bases=allow_external_blob_outside_bases,
+        )
+
+        return write_fragments(
             reader,
             uri,
-            schema=schema,
+            return_transaction=False,
+            schema=attempt_schema,
             mode=mode,
             max_rows_per_file=max_rows_per_file,
-            # ``None`` means "use the writer default" upstream, even though
-            # pylance annotates the parameter as a plain ``int``.
-            max_rows_per_group=max_rows_per_group,  # type: ignore[arg-type]
+            max_rows_per_group=max_rows_per_group,
             max_bytes_per_file=max_bytes_per_file,
             data_storage_version=data_storage_version,
             enable_stable_row_ids=enable_stable_row_ids,
@@ -175,14 +156,71 @@ def write_fragment(
             **optional_write_kwargs,
         )
 
-    fragments = call_with_retry(_write_fragments, **retry_params)
-    return [(fragment, schema) for fragment in fragments]
+    def write_once() -> tuple[list["FragmentMetadata"], Optional[pa.Schema], int]:
+        with ExitStack() as resources:
+            stream_iter = iter(stream() if callable(stream) else stream)
+            if callable(stream) or not isinstance(stream, Iterator):
+                close = getattr(stream_iter, "close", None)
+                if callable(close):
+                    resources.callback(close)
+            try:
+                first = next(stream_iter)
+            except StopIteration:
+                return [], schema, 0
+
+            attempt_schema = schema
+            if attempt_schema is None:
+                if _PANDAS_AVAILABLE and isinstance(first, pd.DataFrame):
+                    attempt_schema = pa.Schema.from_pandas(first).remove_metadata()
+                elif isinstance(first, dict):
+                    attempt_schema = pa.Table.from_pydict(
+                        first
+                    ).schema.remove_metadata()
+                else:
+                    attempt_schema = cast(pa.Table, first).schema
+
+            if len(attempt_schema.names) == 0:
+                return [], attempt_schema, 0
+
+            input_rows = 0
+
+            def record_batch_converter() -> Generator[pa.RecordBatch, None, None]:
+                nonlocal input_rows
+                for block in chain([first], stream_iter):
+                    table = pd_to_arrow(block, attempt_schema)
+                    for batch in table.to_batches():
+                        input_rows += batch.num_rows
+                        yield batch
+
+            batches = record_batch_converter()
+            resources.callback(batches.close)
+            reader = resources.enter_context(
+                pa.RecordBatchReader.from_batches(attempt_schema, batches)
+            )
+            fragments = _write_fragments(reader, attempt_schema)
+            # Include an unexpected unread remainder so an early return from
+            # the writer cannot hide missing rows.
+            for _ in reader:
+                pass
+            return fragments, attempt_schema, input_rows
+
+    fragments, result_schema, input_rows = call_with_retry(write_once, **retry_params)
+    fragment_rows = sum(fragment.num_rows for fragment in fragments)
+    if fragment_rows != input_rows:
+        raise RuntimeError(
+            "Lance fragment write row count mismatch: "
+            f"expected {input_rows}, wrote {fragment_rows}"
+        )
+    if result_schema is None:
+        return []
+    return [(fragment, result_schema) for fragment in fragments]
 
 
 def _get_optional_write_fragments_kwargs(
     write_fragments: Callable[..., Any],
     *,
     target_bases: Optional[list[str]],
+    target_all_bases: Optional[bool],
     base_store_params: Optional[dict[str, dict[str, Any]]],
     external_blob_mode: Literal["reference", "ingest"],
     allow_external_blob_outside_bases: bool,
@@ -191,15 +229,19 @@ def _get_optional_write_fragments_kwargs(
     params, allow_external_blob_outside_bases = _prepare_write_fragments_options(
         write_fragments,
         target_bases=target_bases,
+        target_all_bases=target_all_bases,
         base_store_params=base_store_params,
         external_blob_mode=external_blob_mode,
         allow_external_blob_outside_bases=allow_external_blob_outside_bases,
-        stacklevel=4,
+        stacklevel=7,
     )
     kwargs: dict[str, Any] = {}
 
     if "target_bases" in params and target_bases is not None:
         kwargs["target_bases"] = target_bases
+
+    if "target_all_bases" in params and target_all_bases is not None:
+        kwargs["target_all_bases"] = target_all_bases
 
     if "base_store_params" in params and base_store_params is not None:
         kwargs["base_store_params"] = base_store_params
@@ -216,6 +258,7 @@ def _get_optional_write_fragments_kwargs(
 def prepare_fragment_write_options(
     *,
     target_bases: Optional[list[str]] = None,
+    target_all_bases: Optional[bool] = None,
     base_store_params: Optional[dict[str, dict[str, Any]]] = None,
     external_blob_mode: Literal["reference", "ingest"],
     allow_external_blob_outside_bases: bool,
@@ -224,6 +267,7 @@ def prepare_fragment_write_options(
     """Validate fragment write options and return normalized allow flag."""
     if (
         target_bases is None
+        and target_all_bases is None
         and base_store_params is None
         and external_blob_mode == "reference"
         and not allow_external_blob_outside_bases
@@ -235,6 +279,7 @@ def prepare_fragment_write_options(
     _, allow_external_blob_outside_bases = _prepare_write_fragments_options(
         write_fragments,
         target_bases=target_bases,
+        target_all_bases=target_all_bases,
         base_store_params=base_store_params,
         external_blob_mode=external_blob_mode,
         allow_external_blob_outside_bases=allow_external_blob_outside_bases,
@@ -247,15 +292,22 @@ def _prepare_write_fragments_options(
     write_fragments: Callable[..., Any],
     *,
     target_bases: Optional[list[str]],
+    target_all_bases: Optional[bool],
     base_store_params: Optional[dict[str, dict[str, Any]]],
     external_blob_mode: Literal["reference", "ingest"],
     allow_external_blob_outside_bases: bool,
     stacklevel: int,
 ) -> tuple[Mapping[str, inspect.Parameter], bool]:
+    if target_bases and target_all_bases is not None:
+        raise ValueError("'target_bases' and 'target_all_bases' are mutually exclusive")
+
     params = inspect.signature(write_fragments).parameters
 
     if target_bases is not None and "target_bases" not in params:
         raise _unsupported_write_fragments_option_error("target_bases")
+
+    if target_all_bases is not None and "target_all_bases" not in params:
+        raise _unsupported_write_fragments_option_error("target_all_bases")
 
     if base_store_params is not None and "base_store_params" not in params:
         raise _unsupported_write_fragments_option_error("base_store_params")
@@ -308,8 +360,10 @@ class LanceFragmentWriter:
 
         Then use the returned location as the uri. This ensures all distributed workers
         write to the same resolved location.
-    transform : Callable[[pa.Table], Union[pa.Table, Generator]], optional
-        A callable to transform the input batch. Default is None.
+    transform : Callable[[pa.Table], Union[pa.Table, Iterable[pa.Table]]], optional
+        A callable to transform the input batch. Default is None. Each retry
+        invokes it again with the same original Arrow table. It must produce
+        logically equivalent output; callers must handle repeated side effects.
     schema : pyarrow.Schema, optional
         The schema of the dataset.
     max_rows_per_file : int, optional
@@ -343,6 +397,10 @@ class LanceFragmentWriter:
         References to base paths where data should be written. Each string
         is resolved by matching base name or base path URI from registered
         bases.
+    target_all_bases : bool, optional
+        Select all registered bases, including primary storage when True and
+        excluding it when False. None preserves the default. Mutually exclusive
+        with non-empty target_bases. Round-robin restarts on each invocation.
     base_store_params : dict, optional
         Runtime-only storage options keyed by registered base path URI.
     external_blob_mode : {"reference", "ingest"}, default "reference"
@@ -364,6 +422,10 @@ class LanceFragmentWriter:
         Retry parameters for write operations. Default is None.
         If provided, should contain keys like 'description', 'match',
         'max_attempts', and 'max_backoff_s'.
+        None or an omitted 'max_attempts' means a single streaming attempt.
+        Multiple attempts recreate the transformed stream from the original
+        Arrow table, without IPC staging. The transform may execute more than
+        once and must return complete, logically equivalent output each time.
 
     Notes
     -----
@@ -380,9 +442,7 @@ class LanceFragmentWriter:
         self,
         uri: str,
         *,
-        transform: Optional[
-            Callable[[pa.Table], pa.Table | Generator[pa.Table, None, None]]
-        ] = None,
+        transform: Optional[Callable[[pa.Table], pa.Table | Iterable[pa.Table]]] = None,
         schema: Optional[pa.Schema] = None,
         max_rows_per_file: int = 1024 * 1024,
         max_bytes_per_file: Optional[int] = None,
@@ -395,6 +455,7 @@ class LanceFragmentWriter:
         base_store_params: Optional[dict[str, dict[str, Any]]] = None,
         initial_bases: Optional[list[Any]] = None,
         target_bases: Optional[list[str]] = None,
+        target_all_bases: Optional[bool] = None,
         external_blob_mode: Literal["reference", "ingest"] = "reference",
         allow_external_blob_outside_bases: bool = False,
         namespace_impl: Optional[str] = None,
@@ -414,6 +475,7 @@ class LanceFragmentWriter:
 
         allow_external_blob_outside_bases = prepare_fragment_write_options(
             target_bases=target_bases,
+            target_all_bases=target_all_bases,
             base_store_params=base_store_params,
             external_blob_mode=external_blob_mode,
             allow_external_blob_outside_bases=allow_external_blob_outside_bases,
@@ -434,6 +496,7 @@ class LanceFragmentWriter:
         self.base_store_params = base_store_params
         self.initial_bases = normalize_initial_bases(initial_bases)
         self.target_bases = target_bases
+        self.target_all_bases = target_all_bases
         self.external_blob_mode = external_blob_mode
         self.allow_external_blob_outside_bases = allow_external_blob_outside_bases
         self.namespace_impl = namespace_impl
@@ -468,15 +531,14 @@ class LanceFragmentWriter:
                 # Arrow table is the only remaining documented block type.
                 table = cast(pa.Table, batch)
 
-        transformed = self.transform(table)
-        blocks: Iterable[pa.Table]
-        if isinstance(transformed, Generator):
-            blocks = transformed
-        else:
-            blocks = (t for t in [transformed])
+        def stream_factory() -> Iterator[pa.Table]:
+            transformed = self.transform(table)
+            if isinstance(transformed, pa.Table):
+                return iter((transformed,))
+            return iter(transformed)
 
         fragments = write_fragment(
-            blocks,
+            stream_factory,
             self.uri,
             schema=self.schema,
             mode=self.mode,
@@ -489,6 +551,7 @@ class LanceFragmentWriter:
             base_store_params=self.base_store_params,
             initial_bases=self.initial_bases,
             target_bases=self.target_bases,
+            target_all_bases=self.target_all_bases,
             external_blob_mode=self.external_blob_mode,
             allow_external_blob_outside_bases=self.allow_external_blob_outside_bases,
             namespace_impl=self.namespace_impl,
