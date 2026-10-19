@@ -24,6 +24,7 @@ from .utils import (
     normalize_initial_bases,
     resolve_namespace_table,
     validate_uri_or_namespace,
+    validate_write_mode,
 )
 
 if TYPE_CHECKING:
@@ -1210,11 +1211,7 @@ def _validate_write_args(
     together (to create at a specific location and register with namespace).
     For append mode, requires exactly one of uri OR namespace parameters.
     """
-    valid_modes = {"create", "append", "overwrite"}
-    if mode not in valid_modes:
-        raise ValueError(
-            f"Invalid write mode {mode!r}. Must be one of {sorted(valid_modes)}."
-        )
+    validate_write_mode(mode)
 
     has_ns = has_namespace_params(namespace_impl, table_id)
 
