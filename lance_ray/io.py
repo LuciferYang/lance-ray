@@ -155,33 +155,6 @@ def read_lance(
     )
 
 
-def _open_lance_version(
-    uri: str,
-    storage_options: Optional[dict[str, Any]],
-    base_store_params_kwargs: dict[str, Any],
-) -> Optional[int]:
-    """Return the current version of the dataset at ``uri``, or None if it cannot be opened."""
-    try:
-        dataset = LanceDataset(
-            uri, storage_options=storage_options, **base_store_params_kwargs
-        )
-        return dataset.version
-    except Exception:
-        return None
-
-
-def _refresh_version(
-    uri: str,
-    storage_options: Optional[dict[str, Any]],
-    base_store_params_kwargs: dict[str, Any],
-    *,
-    fallback: Optional[int],
-) -> Optional[int]:
-    """Re-open ``uri`` to read its version, keeping ``fallback`` if it cannot be opened."""
-    version = _open_lance_version(uri, storage_options, base_store_params_kwargs)
-    return version if version is not None else fallback
-
-
 def write_lance(
     ds: Dataset,
     uri: Optional[str] = None,
@@ -350,9 +323,13 @@ def write_lance(
     if base_store_params:
         base_store_params_kwargs = {"base_store_params": base_store_params}
 
-    dest_version = _open_lance_version(
-        dest_uri, storage_options, base_store_params_kwargs
-    )
+    dest_version: Optional[int]
+    try:
+        dest_version = LanceDataset(
+            dest_uri, storage_options=storage_options, **base_store_params_kwargs
+        ).version
+    except Exception:
+        dest_version = None
     dest_exists = dest_version is not None
 
     # Enforce mode semantics.
@@ -434,47 +411,11 @@ def write_lance(
                 "LanceFragmentWriter returned no fragments for a non-empty batch"
             )
 
-        # Commit after each batch.
-        if not first_commit_done:
-            if mode == "append" and dest_exists:
-                # First commit appends onto the existing dataset.
-                LanceDataset.commit(
-                    dest_uri,
-                    LanceOperation.Append(fragments),
-                    read_version=dest_version,
-                    storage_options=storage_options,
-                    enable_stable_row_ids=enable_stable_row_ids,
-                    **base_store_params_kwargs,
-                )
-                first_commit_done = True
-                dest_version = _refresh_version(
-                    dest_uri,
-                    storage_options,
-                    base_store_params_kwargs,
-                    fallback=dest_version,
-                )
-            else:
-                # create / overwrite, or a destination that does not yet exist.
-                LanceDataset.commit(
-                    dest_uri,
-                    LanceOperation.Overwrite(
-                        schema_obj,
-                        fragments,
-                        initial_bases=overwrite_initial_bases,
-                    ),
-                    read_version=None,
-                    storage_options=storage_options,
-                    enable_stable_row_ids=enable_stable_row_ids,
-                    **base_store_params_kwargs,
-                )
-                first_commit_done = True
-                dest_exists = True
-                dest_version = _open_lance_version(
-                    dest_uri, storage_options, base_store_params_kwargs
-                )
-        else:
-            # Subsequent commits always append.
-            LanceDataset.commit(
+        # Commit after each batch: the first commit honours ``mode`` and later
+        # ones append. ``commit`` returns the dataset at the new version, which
+        # the next append reads from.
+        if first_commit_done or mode == "append":
+            committed = LanceDataset.commit(
                 dest_uri,
                 LanceOperation.Append(fragments),
                 read_version=dest_version,
@@ -482,12 +423,21 @@ def write_lance(
                 enable_stable_row_ids=enable_stable_row_ids,
                 **base_store_params_kwargs,
             )
-            dest_version = _refresh_version(
+        else:
+            committed = LanceDataset.commit(
                 dest_uri,
-                storage_options,
-                base_store_params_kwargs,
-                fallback=dest_version,
+                LanceOperation.Overwrite(
+                    schema_obj,
+                    fragments,
+                    initial_bases=overwrite_initial_bases,
+                ),
+                read_version=None,
+                storage_options=storage_options,
+                enable_stable_row_ids=enable_stable_row_ids,
+                **base_store_params_kwargs,
             )
+        dest_version = committed.version
+        first_commit_done = True
 
         rows_seen += tbl.num_rows
 
