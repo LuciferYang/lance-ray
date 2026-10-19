@@ -413,6 +413,18 @@ class TestReadWrite:
         assert result.columns.tolist() == ["id", "value"]
         assert result["id"].tolist() == [1, 2, 3]
 
+    def test_append_arrow_extra_column_raises(self, temp_dir: str) -> None:
+        """Reordering columns to the existing schema must not drop extra ones."""
+        path = Path(temp_dir) / "append_arrow_extra.lance"
+        lr.write_lance(
+            ray.data.from_arrow(pa.table({"id": [1], "value": [10]})), str(path)
+        )
+
+        extra = ray.data.from_arrow(pa.table({"value": [20], "id": [2], "id_2": [4]}))
+        with pytest.raises(Exception, match="field names are not matching"):
+            lr.write_lance(extra, str(path), mode="append")
+        assert lance.dataset(str(path)).count_rows() == 1
+
     def test_overwrite_multi_fragment_schema_change(self, temp_dir: str) -> None:
         """Distributed overwrite across many fragments evolves the schema and
         writes complete, correct data.
@@ -525,12 +537,7 @@ class TestReadWrite:
         assert result["id_2"].tolist() == [8, 10]  # new column evolved on overwrite
 
     def test_stream_append_extra_column_raises(self, temp_dir: str) -> None:
-        """Streaming append rejects columns absent from the existing schema.
-
-        Unlike the non-streaming write (which pins the existing schema and drops
-        such columns), the streaming path infers the schema from the batch, so
-        pylance's append validation raises on the unexpected column.
-        """
+        """Streaming append rejects columns absent from the existing schema."""
         path = Path(temp_dir) / "stream_append_extra.lance"
         original_data = pd.DataFrame({"id": [1, 2], "value": [10, 20]})
         lr.write_lance(ray.data.from_pandas(original_data), str(path))
@@ -547,17 +554,11 @@ class TestReadWrite:
 
     def test_create_inconsistent_column_order_raises(self, temp_dir: str) -> None:
         """Distributed create with blocks in different column orders raises
-        instead of silently transposing data.
-
-        pylance assigns field ids by column position in create/overwrite mode,
-        so fragments written by blocks with divergent column order (e.g. a
-        union of differently ordered sources) cannot all match one committed
-        schema. The write must fail loudly rather than corrupt the data.
-        """
+        before committing a version that cannot be read back."""
         path = Path(temp_dir) / "inconsistent_order.lance"
         ds1 = ray.data.from_items([{"a": i, "b": i * 10} for i in range(6)])
         ds2 = ray.data.from_items([{"b": i * 10, "a": i} for i in range(6, 12)])
-        with pytest.raises(ValueError, match="inconsistent column order"):
+        with pytest.raises(ValueError, match="different columns or column types"):
             lr.write_lance(
                 ds1.union(ds2),
                 str(path),
@@ -567,7 +568,97 @@ class TestReadWrite:
                 max_rows_per_file=2,
             )
 
-    def test_create_inconsistent_order_with_explicit_schema(self, temp_dir: str) -> None:
+    def test_overwrite_inconsistent_column_types_raises(self, temp_dir: str) -> None:
+        """Blocks with the same column order but different types must not
+        commit an overwrite whose data cannot be read back."""
+        path = Path(temp_dir) / "inconsistent_types.lance"
+        lr.write_lance(ray.data.from_items([{"id": 0}]), str(path))
+        version = lance.dataset(str(path)).version
+
+        ds1 = ray.data.from_arrow(pa.table({"id": pa.array([1, 2], pa.int32())}))
+        ds2 = ray.data.from_arrow(pa.table({"id": pa.array([3, 4], pa.int64())}))
+        with pytest.raises(ValueError, match="different columns or column types"):
+            lr.write_lance(
+                ds1.union(ds2),
+                str(path),
+                mode="overwrite",
+                min_rows_per_file=2,
+                max_rows_per_file=2,
+            )
+        assert lance.dataset(str(path)).version == version
+
+    @pytest.mark.parametrize("null_first", [True, False])
+    def test_create_all_null_block_takes_other_type(
+        self, temp_dir: str, null_first: bool
+    ) -> None:
+        """A block whose column is all null (type ``null``) must not make the
+        write fail, whichever block comes first."""
+        path = Path(temp_dir) / "all_null_block.lance"
+        nulls = pa.table({"id": [1, 2], "x": pa.nulls(2)})
+        ints = pa.table({"id": [3, 4], "x": [7, 8]})
+        first, second = (nulls, ints) if null_first else (ints, nulls)
+        lr.write_lance(
+            ray.data.from_arrow(first).union(ray.data.from_arrow(second)),
+            str(path),
+            min_rows_per_file=2,
+            max_rows_per_file=2,
+        )
+
+        table = lance.dataset(str(path)).to_table().sort_by("id")
+        assert table.schema.field("x").type == pa.int64()
+        assert table["x"].to_pylist() == [None, None, 7, 8]
+
+    @pytest.mark.parametrize("non_nullable_first", [True, False])
+    def test_create_mixed_nullability_commits_nullable(
+        self, temp_dir: str, non_nullable_first: bool
+    ) -> None:
+        """A column non-nullable in one block and holding nulls in another must
+        be committed as nullable so every fragment can be read."""
+        path = Path(temp_dir) / "mixed_nullability.lance"
+        required = pa.schema([pa.field("v", pa.int64(), nullable=False)])
+        no_nulls = pa.table({"v": [1, 2]}, schema=required)
+        with_nulls = pa.table({"v": [3, None]})
+        first, second = (
+            (no_nulls, with_nulls) if non_nullable_first else (with_nulls, no_nulls)
+        )
+        lr.write_lance(
+            ray.data.from_arrow(first).union(ray.data.from_arrow(second)),
+            str(path),
+            min_rows_per_file=2,
+            max_rows_per_file=2,
+        )
+
+        table = lance.dataset(str(path)).to_table()
+        assert table.schema.field("v").nullable
+        assert sorted(table["v"].to_pylist(), key=lambda v: (v is None, v)) == [
+            1,
+            2,
+            3,
+            None,
+        ]
+
+    def test_create_list_child_names_differ(self, temp_dir: str) -> None:
+        """``list<item>`` and ``list<element>`` are the same type."""
+        path = Path(temp_dir) / "list_child_names.lance"
+        item = pa.table(
+            {"v": pa.array([[1], [2]], pa.list_(pa.field("item", pa.int64())))}
+        )
+        element = pa.table(
+            {"v": pa.array([[3], [4]], pa.list_(pa.field("element", pa.int64())))}
+        )
+        lr.write_lance(
+            ray.data.from_arrow(item).union(ray.data.from_arrow(element)),
+            str(path),
+            min_rows_per_file=2,
+            max_rows_per_file=2,
+        )
+
+        values = lance.dataset(str(path)).to_table()["v"].to_pylist()
+        assert sorted(value[0] for value in values if value) == [1, 2, 3, 4]
+
+    def test_create_inconsistent_order_with_explicit_schema(
+        self, temp_dir: str
+    ) -> None:
         """An explicit schema aligns differently-ordered blocks by name, so the
         distributed create writes correctly with no transposition."""
         path = Path(temp_dir) / "inconsistent_order_fixed.lance"

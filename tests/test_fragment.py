@@ -1237,9 +1237,7 @@ class TestLanceFragmentWriterCommitter:
         assert sorted(cast("list[int]", tbl["id"].to_pylist())) == list(range(10))
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
-    def test_fragment_writer_overwrite_mode_schema_change(
-        self, tmp_path: Path
-    ) -> None:
+    def test_fragment_writer_overwrite_mode_schema_change(self, tmp_path: Path) -> None:
         """Writer+committer overwrite evolves the schema when the SAME mode is
         passed to both (the matching mode is required; see class docs)."""
         # Initial dataset with two columns.

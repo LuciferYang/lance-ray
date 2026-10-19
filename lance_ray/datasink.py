@@ -38,6 +38,30 @@ if TYPE_CHECKING:
 WriteReturn = list[tuple[bytes, bytes]]
 
 
+def _merge_block_schemas(committed: pa.Schema, block: pa.Schema) -> Optional[pa.Schema]:
+    """Merge two block schemas field by field, or return None if they conflict.
+
+    Names must match in order. Types must be equal, except that a ``null``
+    column (a block where the column is all null) takes the other block's type.
+    A field is nullable if it is nullable in either block. Metadata comes from
+    ``block``.
+    """
+    if committed.names != block.names:
+        return None
+    fields = []
+    for committed_field, block_field in zip(committed, block, strict=True):
+        nullable = committed_field.nullable or block_field.nullable
+        if block_field.type == committed_field.type or pa.types.is_null(
+            committed_field.type
+        ):
+            fields.append(block_field.with_nullable(nullable))
+        elif pa.types.is_null(block_field.type):
+            fields.append(committed_field.with_nullable(nullable))
+        else:
+            return None
+    return pa.schema(fields).with_metadata(block.metadata or {})
+
+
 def _declare_table_with_fallback(
     namespace: "LanceNamespace", table_id: list[str]
 ) -> tuple[Optional[str], Optional[dict[str, str]]]:
@@ -226,24 +250,24 @@ class _BaseLanceDatasink(Datasink[WriteReturn]):
                 fragment = pickle.loads(fragment_str)
                 fragments.append(fragment)
                 frag_schema = pickle.loads(schema_str)
-                # In create/overwrite mode pylance assigns field ids by column
-                # position, so every block must share one column order. If
-                # blocks differ (e.g. a union of differently ordered sources),
-                # committing their fragments under a single schema would read
-                # the data back transposed. Fail loudly instead of silently
-                # corrupting; an explicit ``schema`` aligns every block by name.
-                if (
-                    schema is not None
-                    and self.mode in {"create", "overwrite"}
-                    and frag_schema.names != schema.names
-                ):
-                    raise ValueError(
-                        "Distributed create/overwrite received blocks with "
-                        f"inconsistent column order ({frag_schema.names} vs "
-                        f"{schema.names}); their fragments would be committed "
-                        "under a single schema and read back transposed. Pass "
-                        "an explicit `schema=` so every block is aligned by name."
-                    )
+                # In create/overwrite mode every write task assigns field ids
+                # from its own block's schema, but all fragments are committed
+                # under one schema. Blocks whose columns differ in order or type
+                # (e.g. a union of different sources) would commit a version
+                # that cannot be read back, so fail before committing. A column
+                # that is all null in some blocks takes the other blocks' type.
+                # An explicit ``schema`` casts every block to the same fields.
+                if schema is not None and self.mode in {"create", "overwrite"}:
+                    merged = _merge_block_schemas(schema, frag_schema)
+                    if merged is None:
+                        raise ValueError(
+                            "Distributed create/overwrite received blocks with "
+                            "different columns or column types "
+                            f"({schema.remove_metadata()} vs "
+                            f"{frag_schema.remove_metadata()}). Pass an explicit "
+                            "`schema=` so every block is written with the same fields."
+                        )
+                    frag_schema = merged
                 schema = frag_schema
         # Check weather writer has fragments or not.
         # Skip commit when there are no fragments.
@@ -295,9 +319,8 @@ class LanceDatasink(_BaseLanceDatasink):
         mode : str, optional
             The write mode. Default is 'create'.
             Choices are 'create', 'append', 'overwrite'. "create" and "overwrite"
-            write data using the incoming schema (schema evolution), while
-            "append" validates against the existing dataset schema and drops
-            columns not present in it.
+            use the schema of the incoming data; "append" keeps the existing
+            dataset schema.
         min_rows_per_file : int, optional
             The minimum number of rows per file. Default is 1024 * 1024.
         max_rows_per_file : int, optional

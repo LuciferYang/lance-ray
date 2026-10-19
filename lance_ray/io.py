@@ -216,17 +216,13 @@ def write_lance(
         table_id: The table identifier as a list of strings. Must be provided together
             with namespace_impl and namespace_properties.
         schema: The schema of the dataset. If not provided, it is inferred from the
-            data. For distributed create/overwrite writes, provide a schema when
-            input blocks may differ in column order (e.g. a union of differently
-            ordered sources); otherwise the write raises rather than risk writing
-            transposed data.
+            data. For create/overwrite, provide it when input blocks may differ
+            in column order or types (e.g. a union of different sources);
+            otherwise the write raises before committing.
         mode: The write mode (default "create"). Can be "create", "append", or
-            "overwrite". "create" writes a new dataset and "overwrite" replaces an
-            existing one; both write data using the schema of the incoming data, so
-            new columns are persisted (schema evolution). "append" adds data under
-            the existing dataset schema and does not evolve it: in the default
-            non-streaming write, columns not present in the existing schema are
-            dropped, while with ``stream=True`` they raise a schema-mismatch error.
+            "overwrite". "create" and "overwrite" use the schema of the incoming
+            data, so an overwrite can add, drop or retype columns. "append" keeps
+            the existing dataset schema.
         min_rows_per_file: The minimum number of rows per file.
         max_rows_per_file: The maximum number of rows per file.
         max_bytes_per_file: The maximum number of bytes per file. This is a soft
