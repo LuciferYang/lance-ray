@@ -4,7 +4,7 @@
 
 ```python
 add_columns(
-    uri,
+    uri=None,
     *, 
     transform,
     storage_options=None,
@@ -18,13 +18,13 @@ Add columns to an existing Lance dataset using Ray's distributed processing.
 
 **Parameters:**
 
-- `uri`: Path to the Lance dataset. `add_columns` requires a concrete URI.
+- `uri`: Path to the Lance dataset (either `uri` OR `namespace_impl` + `table_id` required)
 - `transform`: Transform function to apply for adding columns
-- `storage_options`: Optional Lance storage configuration dictionary, such as S3 or MinIO `access_key_id`, `secret_access_key`, `endpoint` for the S3 API endpoint such as `http://localhost:9000`, and `allow_http`
-- `table_id`: Optional table identifier used with `namespace_impl` for credential vending on distributed workers
+- `storage_options`: Optional Lance storage configuration dictionary, for example S3 or MinIO credentials and `endpoint`
+- `table_id`: Table identifier as list of strings (requires `namespace_impl`)
 - `namespace_impl`: Optional namespace implementation type, such as `"dir"` or `"rest"`
 - `namespace_properties`: Optional namespace connection properties used with `namespace_impl`
-- `filter`: Optional filter expression to apply
+- `filter`: Not supported yet; reserved for when fragment filtering is available
 - `read_columns`: Optional list of columns to read from original dataset
 - `reader_schema`: Optional schema for the reader
 - `read_version`: Optional version to read
