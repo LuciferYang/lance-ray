@@ -225,8 +225,8 @@ def _run_cleanup(
     if failed:
         raise RuntimeError(
             f"Cleanup failed in {len(failed)} of {len(tasks)} tasks; the old versions "
-            "are removed, and a later cleanup removes the files these tasks left once "
-            f"they are seven days old: {'; '.join(r['error'] for r in failed)}"
+            "are removed, and later cleanups only remove the files these tasks left "
+            f"as unverified files: {'; '.join(r['error'] for r in failed)}"
         )
     sweep_results = [r["result"] for r in results]
     if explain:
@@ -266,9 +266,9 @@ def cleanup_old_versions(
 
     A failed range is retried up to ``max_task_retries`` times. If a range still
     fails, a ``RuntimeError`` is raised. The old versions are already gone by
-    then, and a later cleanup removes the files the range left once they are
-    seven days old. With pylance releases that cannot distribute a cleanup, it
-    runs on the driver instead.
+    then, and later cleanups only remove the files the range left as unverified
+    files. With pylance releases that cannot distribute a cleanup, it runs on the
+    driver instead.
 
     Args:
         uri: The URI of the dataset. Either uri OR (namespace_impl + table_id)
@@ -279,7 +279,7 @@ def cleanup_old_versions(
         retain_versions: Retain the last N versions.
         versions: Remove only these versions.
         delete_unverified: Also remove recent files no version references. Only
-            safe when nothing else is writing to the dataset.
+            safe when nothing else writes to the dataset until the cleanup ends.
         error_if_tagged_old_versions: Raise if a tagged version would otherwise
             be removed.
         delete_rate_limit: Approximate maximum delete requests per second for

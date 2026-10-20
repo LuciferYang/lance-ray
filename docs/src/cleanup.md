@@ -58,9 +58,9 @@ Takes the same arguments, without the delete limits, plus `max_files` (default: 
 ## Safety
 
 - A file is removed only if no retained version references it. Before listing its range, each worker reads the versions committed since the plan and keeps their files.
-- A file that no version references at all, for example one left by a failed write, is removed only once it is seven days old, counted from when the plan was created. `delete_unverified=True` removes such files regardless of age. Only set it when nothing else is writing to the dataset, or the files of an in-progress write can be removed.
+- A file that no version references at all, for example one left by a failed write, is removed only once it is seven days old, counted from when the plan was created. `delete_unverified=True` removes such files regardless of age. Only set it when nothing else writes to the dataset until the cleanup ends, or the files of an in-progress write can be removed.
 - The old versions are removed while planning, before any file is swept, so none of them can be restored, tagged or branched from while its files are being removed. If a tag or branch is created on one of them while the plan is being made, the cleanup fails before removing anything.
-- If a range still fails after its retries, a `RuntimeError` is raised. The old versions are already gone, and no version references the files the range left, so a later cleanup removes them once they are seven days old.
+- If a range still fails after its retries, a `RuntimeError` is raised. The old versions are already gone, and no version references the files the range left, so later cleanups only remove them as unverified files.
 - Every worker must run the same pylance version as the driver.
 - Cleaning referenced branches is not supported.
 
