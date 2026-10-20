@@ -61,6 +61,9 @@ try:
 except ImportError:  # pragma: no cover - environment dependent
     index_mod = _load_index_module_with_stubs()
 
+# Loaded with the index module, from the same (possibly stubbed) package.
+from lance_ray import _dispatch as dispatch_mod  # noqa: E402
+
 
 class _FakeField:
     def __init__(self, name: str, field_type: Any = None) -> None:
@@ -147,9 +150,9 @@ def test_map_async_with_pool_dispatches_to_idle_workers() -> None:
     submission would put both slow batches on the same worker, one after the
     other; idle dispatch runs them concurrently on different workers.
     """
-    results = index_mod._map_async_with_pool(
-        create_fragment_handler=lambda: timed_sleep_handler,
-        fragment_batches=[[200], [5], [200], [5]],
+    results = dispatch_mod._map_async_with_pool(
+        create_handler=lambda: timed_sleep_handler,
+        items=[[200], [5], [200], [5]],
         num_workers=2,
         ray_remote_args={"num_cpus": 1},
         error_prefix="failed",
@@ -168,9 +171,9 @@ def test_map_async_with_pool_retries_failed_tasks(tmp_path: Path) -> None:
             return {"status": "error", "fragment_ids": fragment_ids, "error": "boom"}
         return {"status": "success", "fragment_ids": fragment_ids}
 
-    results = index_mod._map_async_with_pool(
-        create_fragment_handler=lambda: handler,
-        fragment_batches=[[0], [1], [2]],
+    results = dispatch_mod._map_async_with_pool(
+        create_handler=lambda: handler,
+        items=[[0], [1], [2]],
         num_workers=2,
         ray_remote_args=None,
         error_prefix="failed",
@@ -190,9 +193,9 @@ def test_map_async_with_pool_reports_exhausted_retries(tmp_path: Path) -> None:
         attempt_marker(marker_dir, fragment_ids)
         return {"status": "error", "fragment_ids": fragment_ids, "error": "boom"}
 
-    results = index_mod._map_async_with_pool(
-        create_fragment_handler=lambda: handler,
-        fragment_batches=[[0]],
+    results = dispatch_mod._map_async_with_pool(
+        create_handler=lambda: handler,
+        items=[[0]],
         num_workers=1,
         ray_remote_args=None,
         error_prefix="failed",
@@ -207,9 +210,9 @@ def test_map_async_with_pool_retries_on_a_live_worker_after_worker_death(
     tmp_path: Path,
 ) -> None:
     """A batch whose worker dies is retried elsewhere; the dead worker is dropped."""
-    results = index_mod._map_async_with_pool(
-        create_fragment_handler=lambda: die_once_handler(str(tmp_path / "died")),
-        fragment_batches=[[0], [1]],
+    results = dispatch_mod._map_async_with_pool(
+        create_handler=lambda: die_once_handler(str(tmp_path / "died")),
+        items=[[0], [1]],
         num_workers=2,
         ray_remote_args=None,
         error_prefix="failed",
@@ -223,9 +226,9 @@ def test_map_async_with_pool_keeps_restartable_workers_after_death(
     tmp_path: Path,
 ) -> None:
     """With max_restarts, Ray restarts the dead worker and it keeps serving."""
-    results = index_mod._map_async_with_pool(
-        create_fragment_handler=lambda: die_once_handler(str(tmp_path / "died")),
-        fragment_batches=[[0]],
+    results = dispatch_mod._map_async_with_pool(
+        create_handler=lambda: die_once_handler(str(tmp_path / "died")),
+        items=[[0]],
         num_workers=1,
         ray_remote_args={"max_restarts": 1},
         error_prefix="failed",
@@ -240,9 +243,9 @@ def test_map_async_with_pool_fails_when_every_worker_died() -> None:
         os._exit(1)
 
     with pytest.raises(RuntimeError, match="failed: every worker has died"):
-        index_mod._map_async_with_pool(
-            create_fragment_handler=lambda: handler,
-            fragment_batches=[[0]],
+        dispatch_mod._map_async_with_pool(
+            create_handler=lambda: handler,
+            items=[[0]],
             num_workers=1,
             ray_remote_args=None,
             error_prefix="failed",
@@ -288,7 +291,7 @@ def _patch_create_index(
         return "ivf_ref", "pq_ref"
 
     def fake_map_async_with_pool(**kwargs: Any) -> Any:
-        fragment_handler = kwargs["create_fragment_handler"]()
+        fragment_handler = kwargs["create_handler"]()
         return [fragment_handler([0, 1])]
 
     monkeypatch.setattr(index_mod, "_check_pylance_version", lambda: None)
@@ -381,7 +384,7 @@ def test_create_index_supports_ivf_rq(monkeypatch: pytest.MonkeyPatch) -> None:
 
     def fake_map_async_with_pool(**kwargs: Any) -> Any:
         captured["map_kwargs"] = kwargs
-        kwargs["create_fragment_handler"]()
+        kwargs["create_handler"]()
         return [
             {
                 "status": "success",
@@ -469,7 +472,7 @@ def test_create_index_uses_provided_ivf_rq_model(
 
     def fake_map_async_with_pool(**kwargs: Any) -> Any:
         captured["map_kwargs"] = kwargs
-        kwargs["create_fragment_handler"]()
+        kwargs["create_handler"]()
         return [
             {
                 "status": "success",
@@ -578,7 +581,7 @@ def test_create_scalar_index_uses_segment_path(
 
     def fake_map_async_with_pool(**kwargs: Any) -> Any:
         captured["map_kwargs"] = kwargs
-        kwargs["create_fragment_handler"]()
+        kwargs["create_handler"]()
         return [
             {
                 "status": "success",
@@ -659,7 +662,7 @@ def test_create_index_passes_block_size_to_loads_and_handler(
 
     def fake_map_async_with_pool(**kwargs: Any) -> Any:
         captured["map_kwargs"] = kwargs
-        kwargs["create_fragment_handler"]()
+        kwargs["create_handler"]()
         return [
             {
                 "status": "success",
