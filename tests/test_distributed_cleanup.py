@@ -2,10 +2,10 @@
 
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 from unittest.mock import patch
 
 import lance
@@ -13,7 +13,10 @@ import lance_ray as lr
 import pyarrow as pa
 import pytest
 import ray
+from lance.dataset import LanceDataset
 from lance_ray import cleanup as cleanup_mod
+
+from _ray_test_support import FakeCleanupStats, FakeSweepTask
 
 requires_distributed_cleanup = pytest.mark.skipif(
     not cleanup_mod._supports_distributed_cleanup(),
@@ -59,8 +62,7 @@ def _expected(uri: str) -> tuple[Any, set[str]]:
 
 
 @requires_distributed_cleanup
-@pytest.mark.parametrize("max_tasks", [1, 64])
-def test_matches_single_process_cleanup(uri: str, max_tasks: int) -> None:
+def test_matches_single_process_cleanup(uri: str) -> None:
     expected, remaining = _expected(uri)
     assert expected.stats.old_versions == 4
     assert expected.stats.data_files_removed > 0
@@ -68,16 +70,14 @@ def test_matches_single_process_cleanup(uri: str, max_tasks: int) -> None:
     assert expected.stats.deletion_files_removed > 0
 
     explanation = lr.explain_cleanup_old_versions(
-        uri, older_than=timedelta(0), num_workers=2, max_tasks=max_tasks
+        uri, older_than=timedelta(0), num_workers=2
     )
     assert explanation.stats.bytes_removed == expected.stats.bytes_removed
     assert sorted(f.path for f in explanation.candidate_files) == sorted(
         f.path for f in expected.candidate_files
     )
 
-    stats = lr.cleanup_old_versions(
-        uri, older_than=timedelta(0), num_workers=2, max_tasks=max_tasks
-    )
+    stats = lr.cleanup_old_versions(uri, older_than=timedelta(0), num_workers=2)
     assert stats.old_versions == expected.stats.old_versions
     assert stats.data_files_removed == expected.stats.data_files_removed
     assert stats.bytes_removed == expected.stats.bytes_removed
@@ -137,17 +137,6 @@ def _failing_first_attempt(marker_dir: Path) -> Callable[..., Any]:
 
 
 @requires_distributed_cleanup
-def test_failed_task_is_retried(uri: str, tmp_path: Path) -> None:
-    expected, remaining = _expected(uri)
-    with patch.object(cleanup_mod, "_sweep_handler", _failing_first_attempt(tmp_path)):
-        stats = lr.cleanup_old_versions(
-            uri, older_than=timedelta(0), num_workers=2, max_task_retries=1
-        )
-    assert stats.old_versions == expected.stats.old_versions
-    assert _files(uri) == remaining
-
-
-@requires_distributed_cleanup
 def test_failed_task_raises(uri: str, tmp_path: Path) -> None:
     _, remaining = _expected(uri)
     with (
@@ -169,28 +158,152 @@ def test_failed_task_raises(uri: str, tmp_path: Path) -> None:
     assert _files(uri) == remaining
 
 
-@requires_distributed_cleanup
+class _FakePlan:
+    """Stands in for pylance's ``CleanupPlan`` and records how it is finished."""
+
+    def __init__(self, marker_dir: Path, fail_attempts: dict[int, int], count: int):
+        self.read_version = 3
+        self.num_old_versions = 2
+        self.max_tasks: list[int] = []
+        self.finished: list[list[Any]] = []
+        self.explained: list[list[Any]] = []
+        self._tasks = [
+            FakeSweepTask(index, str(marker_dir), fail_attempts.get(index, 0))
+            for index in range(count)
+        ]
+
+    def tasks(self, max_tasks: int) -> list[FakeSweepTask]:
+        self.max_tasks.append(max_tasks)
+        return self._tasks
+
+    def finish(self, dataset: Any, results: list[Any]) -> FakeCleanupStats:
+        self.finished.append(results)
+        return FakeCleanupStats(
+            data_files_removed=sum(r.stats.data_files_removed for r in results)
+        )
+
+    def finish_explain(self, dataset: Any, results: list[Any]) -> str:
+        self.explained.append(results)
+        return "explanation"
+
+
+@pytest.fixture
+def fake_plan(uri: str, tmp_path: Path) -> Iterator[Callable[..., _FakePlan]]:
+    """Installs a fake ``plan_cleanup_old_versions`` with the real signature, so the
+    driver and the Ray workers run against any pylance release."""
+    marker_dir = tmp_path / "markers"
+    marker_dir.mkdir()
+    patches: list[Any] = []
+
+    def install(
+        count: int = 5, fail_attempts: Optional[dict[int, int]] = None
+    ) -> _FakePlan:
+        plan = _FakePlan(marker_dir, fail_attempts or {}, count)
+
+        def plan_cleanup_old_versions(
+            self: LanceDataset,
+            older_than: Optional[timedelta] = None,
+            retain_versions: Optional[int] = None,
+            *,
+            delete_unverified: bool = False,
+            error_if_tagged_old_versions: bool = True,
+            delete_rate_limit: Optional[int] = None,
+            versions: Optional[list[int]] = None,
+            delete_concurrency: Optional[int] = None,
+            explain: bool = False,
+            max_files: int = 1000,
+        ) -> _FakePlan:
+            return plan
+
+        patcher = patch.object(
+            LanceDataset,
+            "plan_cleanup_old_versions",
+            plan_cleanup_old_versions,
+            create=True,
+        )
+        patcher.start()
+        patches.append(patcher)
+        return plan
+
+    yield install
+    for patcher in reversed(patches):
+        patcher.stop()
+
+
+@pytest.mark.parametrize("explain", [False, True])
+def test_dispatches_every_task_and_finishes(
+    uri: str, fake_plan: Callable[..., _FakePlan], explain: bool
+) -> None:
+    # Task 0 fails once, so it is retried after the others are dispatched.
+    plan = fake_plan(count=5, fail_attempts={0: 1})
+    run = lr.explain_cleanup_old_versions if explain else lr.cleanup_old_versions
+    kwargs: dict[str, Any] = {} if explain else {"delete_concurrency": 3}
+    with patch.object(cleanup_mod, "logger") as log:
+        result = run(
+            uri, older_than=timedelta(0), num_workers=2, max_task_retries=1, **kwargs
+        )
+
+    assert plan.max_tasks == [2 * cleanup_mod._TASKS_PER_WORKER]
+    calls, other = (
+        (plan.explained, plan.finished) if explain else (plan.finished, plan.explained)
+    )
+    assert other == []
+    assert len(calls) == 1
+    # One result per task, in task order.
+    assert [r.index for r in calls[0]] == list(range(5))
+    if explain:
+        assert result == "explanation"
+    else:
+        assert result.data_files_removed == 5
+        assert {r.delete_concurrency for r in calls[0]} == {3}
+    # The driver logs progress once per task, with running totals.
+    progress = [
+        call.args
+        for call in log.info.call_args_list
+        if call.args[0].startswith("Cleanup task")
+    ]
+    assert [args[1] for args in progress] == [1, 2, 3, 4, 5]
+    assert progress[-1][6] == 5
+
+
+def test_passes_max_tasks_to_the_plan(
+    uri: str, fake_plan: Callable[..., _FakePlan]
+) -> None:
+    plan = fake_plan(count=3)
+    lr.cleanup_old_versions(uri, older_than=timedelta(0), num_workers=2, max_tasks=3)
+    assert plan.max_tasks == [3]
+
+
+@pytest.mark.parametrize("explain", [False, True])
+def test_failure_after_retries_does_not_finish(
+    uri: str, fake_plan: Callable[..., _FakePlan], explain: bool
+) -> None:
+    plan = fake_plan(count=3, fail_attempts={1: 2})
+    run = lr.explain_cleanup_old_versions if explain else lr.cleanup_old_versions
+    message = "Explaining cleanup failed" if explain else "files these tasks left"
+    with pytest.raises(RuntimeError, match=message):
+        run(uri, older_than=timedelta(0), num_workers=2, max_task_retries=1)
+    assert plan.finished == []
+    assert plan.explained == []
+
+
 @pytest.mark.parametrize(
-    ("rate", "num_workers", "expected"), [(None, 2, None), (100, 4, 25), (3, 4, 1)]
+    ("rate", "num_workers", "num_tasks", "expected"),
+    [(None, 2, 5, None), (100, 4, 5, 25), (100, 8, 2, 50), (3, 4, 5, 1)],
 )
 def test_rate_limit_is_split_between_workers(
-    uri: str, rate: Any, num_workers: int, expected: Any
+    uri: str,
+    fake_plan: Callable[..., _FakePlan],
+    rate: Optional[int],
+    num_workers: int,
+    num_tasks: int,
+    expected: Optional[int],
 ) -> None:
-    rates: list[Any] = []
-    real = cleanup_mod._sweep_handler
-
-    def recording(dataset_args: Any, concurrency: Any, worker_rate: Any) -> Any:
-        rates.append(worker_rate)
-        return real(dataset_args, concurrency, worker_rate)
-
-    with patch.object(cleanup_mod, "_sweep_handler", recording):
-        lr.cleanup_old_versions(
-            uri,
-            older_than=timedelta(0),
-            num_workers=num_workers,
-            delete_rate_limit=rate,
-        )
-    assert rates == [expected]
+    plan = fake_plan(count=num_tasks)
+    lr.cleanup_old_versions(
+        uri, older_than=timedelta(0), num_workers=num_workers, delete_rate_limit=rate
+    )
+    assert [r.delete_rate_limit for r in plan.finished[0]] == [expected] * num_tasks
 
 
 @pytest.mark.parametrize("explain", [False, True])

@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from datetime import timedelta
 from functools import lru_cache
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import lance
 from lance.dataset import LanceDataset
@@ -154,7 +154,8 @@ def _run_cleanup(
         }
         return dataset.cleanup_old_versions(**cleanup_kwargs, **limits)
 
-    plan = dataset.plan_cleanup_old_versions(
+    # Typed as Any: the pylance this is type-checked against may predate the API.
+    plan = cast(Any, dataset).plan_cleanup_old_versions(
         **cleanup_kwargs,
         delete_rate_limit=delete_rate_limit,
         delete_concurrency=delete_concurrency,
@@ -223,10 +224,16 @@ def _run_cleanup(
     )
     failed = [r for r in results if r["status"] != "success"]
     if failed:
+        errors = "; ".join(r["error"] for r in failed)
+        if explain:
+            raise RuntimeError(
+                f"Explaining cleanup failed in {len(failed)} of {len(tasks)} tasks: "
+                f"{errors}"
+            )
         raise RuntimeError(
             f"Cleanup failed in {len(failed)} of {len(tasks)} tasks; the old versions "
             "are removed, and later cleanups only remove the files these tasks left "
-            f"as unverified files: {'; '.join(r['error'] for r in failed)}"
+            f"as unverified files: {errors}"
         )
     sweep_results = [r["result"] for r in results]
     if explain:

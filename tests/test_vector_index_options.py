@@ -164,6 +164,7 @@ def test_map_async_with_pool_dispatches_to_idle_workers() -> None:
 
 def test_map_async_with_pool_retries_failed_tasks(tmp_path: Path) -> None:
     marker_dir = str(tmp_path)
+    reported: list[tuple[int, str]] = []
 
     def handler(fragment_ids: list[int]) -> dict[str, Any]:
         attempt = attempt_marker(marker_dir, fragment_ids)
@@ -178,16 +179,20 @@ def test_map_async_with_pool_retries_failed_tasks(tmp_path: Path) -> None:
         ray_remote_args=None,
         error_prefix="failed",
         max_task_retries=1,
+        on_result=lambda index, result: reported.append((index, result["status"])),
     )
 
     assert [r["fragment_ids"] for r in results] == [[0], [1], [2]]
     assert [r["status"] for r in results] == ["success"] * 3
+    # Each item is reported once, with its final result.
+    assert sorted(reported) == [(0, "success"), (1, "success"), (2, "success")]
     attempts = sorted(name.split(".")[0] for name in os.listdir(marker_dir))
     assert attempts == ["0", "1", "1", "2"]
 
 
 def test_map_async_with_pool_reports_exhausted_retries(tmp_path: Path) -> None:
     marker_dir = str(tmp_path)
+    reported: list[tuple[int, str]] = []
 
     def handler(fragment_ids: list[int]) -> dict[str, Any]:
         attempt_marker(marker_dir, fragment_ids)
@@ -200,10 +205,12 @@ def test_map_async_with_pool_reports_exhausted_retries(tmp_path: Path) -> None:
         ray_remote_args=None,
         error_prefix="failed",
         max_task_retries=2,
+        on_result=lambda index, result: reported.append((index, result["status"])),
     )
 
     assert results == [{"status": "error", "fragment_ids": [0], "error": "boom"}]
     assert len(os.listdir(marker_dir)) == 3
+    assert reported == [(0, "error")]
 
 
 def test_map_async_with_pool_retries_on_a_live_worker_after_worker_death(

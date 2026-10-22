@@ -49,7 +49,7 @@ cleanup_old_versions(
 
 **Returns:** `CleanupStats` for the whole cleanup.
 
-Each worker logs a line when it finishes a range, with the running number of files and bytes removed.
+The driver logs a line as each range finishes, with the running number of files and bytes removed.
 
 ## `explain_cleanup_old_versions`
 
